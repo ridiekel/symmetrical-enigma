@@ -15,6 +15,43 @@ while [ -h "$SOURCE" ]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
 
+# ---------------------------------------------------------------------------
+# Platform
+# ---------------------------------------------------------------------------
+# Git Bash (MSYS) counts as its own platform: 'uname -s' says MINGW64_NT-..., docker
+# is a *native* Windows binary, and paths come in two flavours (/c/Users/... in the
+# shell, C:/Users/... for everything Windows). See to_host_path/to_unix_path below.
+OS="$(uname -s)"
+IS_WINDOWS=0
+case "$OS" in
+  MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1 ;;
+esac
+
+# MSYS rewrites anything that looks like a unix path before it reaches a native binary.
+# For 'docker run -v src:/workdir' that means the *container* side gets mangled into
+# 'C:\Program Files\Git\workdir'. We therefore switch the conversion off for the docker
+# calls that carry paths (harmless env vars everywhere else) and convert the host side
+# ourselves. Do NOT export these globally: curl.exe/wget.exe still need the conversion.
+NOCONV=(env MSYS_NO_PATHCONV=1 'MSYS2_ARG_CONV_EXCL=*')
+
+# Host path as the native docker client wants it: C:/Users/... on Windows, unchanged elsewhere.
+to_host_path() {
+  if [ "$IS_WINDOWS" = "1" ] && command -v cygpath >/dev/null 2>&1; then
+    cygpath -m "$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+# Path for this shell: /c/Users/... on Windows, unchanged elsewhere.
+to_unix_path() {
+  if [ "$IS_WINDOWS" = "1" ] && command -v cygpath >/dev/null 2>&1; then
+    cygpath -u "$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
 # Parse ccd's own startup args; everything else is passed through to 'claude' unchanged.
 #   --docker            Docker-in-Docker in DooD mode (host socket; siblings on the host daemon)
 #   --docker=host       same
@@ -142,7 +179,13 @@ self_update() {
   for f in $changed; do
     # 'mv' (rename) instead of writing over the file: bash keeps reading the *running*
     # script from its old inode, so overwriting in place would corrupt this session.
-    mv -f "$tmp/$f" "$SCRIPT_DIR/$f"
+    # On Windows a running script can be locked; then we simply keep the current version
+    # instead of killing the session over a failed update.
+    if ! mv -f "$tmp/$f" "$SCRIPT_DIR/$f" 2>/dev/null; then
+      echo "Update could not be applied to '$f' (file in use?) — continuing with the current version." >&2
+      rm -rf "$tmp"
+      return 0
+    fi
   done
   chmod +x "$SCRIPT_DIR/ccd" 2>/dev/null || true
   rm -rf "$tmp"
@@ -176,8 +219,6 @@ mkdir -p "$CONFIG_DIR"
 SSH_DIR="$CONFIG_DIR/ssh"
 mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
-
-OS="$(uname -s)"
 
 docker_running() {
   docker info >/dev/null 2>&1
@@ -218,6 +259,31 @@ start_docker() {
         echo "Cannot start Docker automatically (no systemd). Start the daemon manually." >&2
         exit 1
       fi
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      # Docker Desktop is the only runtime that puts a docker.exe on PATH here. Look in
+      # the usual per-machine/per-user install locations; CCD_DOCKER_DESKTOP overrides.
+      dd_exe=""
+      for cand in \
+        "${CCD_DOCKER_DESKTOP:-}" \
+        "${ProgramFiles:+$ProgramFiles\\Docker\\Docker\\Docker Desktop.exe}" \
+        "${PROGRAMFILES:+$PROGRAMFILES\\Docker\\Docker\\Docker Desktop.exe}" \
+        "${ProgramW6432:+$ProgramW6432\\Docker\\Docker\\Docker Desktop.exe}" \
+        "${LOCALAPPDATA:+$LOCALAPPDATA\\Docker\\Docker Desktop.exe}" \
+        "C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe"
+      do
+        [ -n "$cand" ] || continue
+        cand="$(to_unix_path "$cand")"
+        if [ -f "$cand" ]; then dd_exe="$cand"; break; fi
+      done
+      if [ -z "$dd_exe" ]; then
+        echo "Docker Desktop was not found in the standard install locations." >&2
+        echo "Start it by hand, or point CCD_DOCKER_DESKTOP at 'Docker Desktop.exe'." >&2
+        exit 1
+      fi
+      echo "Starting Docker Desktop..."
+      "$dd_exe" >/dev/null 2>&1 &
+      disown 2>/dev/null || true
       ;;
     *)
       echo "Unsupported OS: $OS" >&2
@@ -288,7 +354,7 @@ if [ "$BUILD_LOCAL" = "1" ]; then
     [ "$REBUILD" = "1" ] && BUILD_OPTS+=(--no-cache)
 
     echo "Building image ($IMAGE) — the first time this can take a while..."
-    docker build "${BUILD_OPTS[@]+"${BUILD_OPTS[@]}"}" -t "$IMAGE" "$SCRIPT_DIR"
+    "${NOCONV[@]}" docker build "${BUILD_OPTS[@]+"${BUILD_OPTS[@]}"}" -t "$IMAGE" "$(to_host_path "$SCRIPT_DIR")"
     build_hash > "$HASH_FILE"
 
     # After a forced rebuild, clean up the leftovers: the previous image now
@@ -308,6 +374,18 @@ fi
 #  doesn't overwrite an OAuth login in the mounted ~/.claude.
 RUN_FLAGS=(--rm -i)
 [ -t 0 ] && RUN_FLAGS+=(-t)
+
+# Git Bash: the MSYS pty is not a Windows console, so 'docker run -it' aborts with
+# "the input device is not a TTY". winpty (ships with Git for Windows) bridges the two.
+DOCKER_RUN=(docker)
+if [ "$IS_WINDOWS" = "1" ] && [ -t 0 ]; then
+  if command -v winpty >/dev/null 2>&1; then
+    DOCKER_RUN=(winpty docker)
+  else
+    echo "Warning: 'winpty' not found — an interactive session may fail with" >&2
+    echo "'the input device is not a TTY'. Non-interactive runs (-p '...') are fine." >&2
+  fi
+fi
 [ -n "${ANTHROPIC_API_KEY:-}" ] && RUN_FLAGS+=(-e ANTHROPIC_API_KEY)
 
 # Forward the GitHub token so 'gh' (api/pr/...) is authenticated right away. In a
@@ -385,7 +463,7 @@ case "$DOCKER_MODE" in
       # via localhost from the container (and the Ryuk reaper works).
       RUN_FLAGS+=(--network host)
     else
-      # macOS: the daemon runs in a VM (Docker Desktop or Colima). The host path from
+      # macOS/Windows: the daemon runs in a VM (Docker Desktop, Colima, WSL2). The host path from
       # the context — e.g. Colima's ~/.colima/<profile>/docker.sock — can NOT serve as a
       # bind source: that path lives under $HOME and is resolved into the VM via virtiofs,
       # where no unix socket can be created
@@ -397,7 +475,7 @@ case "$DOCKER_MODE" in
         exit 1
       fi
       RUN_FLAGS+=(-v /var/run/docker.sock:/var/run/docker.sock)
-      # No host networking on macOS; host.docker.internal points to the host, so
+      # No host networking on macOS/Windows; host.docker.internal points to the host, so
       # testcontainers connects via the published ports.
       RUN_FLAGS+=(-e TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal)
     fi
@@ -410,14 +488,18 @@ esac
 MOUNT_SRC="$PWD"
 WORKDIR_IN="/workdir"
 if GIT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  # Under Git Bash git.exe answers with a Windows path (C:/Users/...) while $PWD is
+  # /c/Users/... — without this the prefix below strips nothing and the working
+  # directory becomes /workdir/c/Users/...
+  GIT_ROOT="$(to_unix_path "$GIT_ROOT")"
   MOUNT_SRC="$GIT_ROOT"
   REL="${PWD#"$GIT_ROOT"}"          # e.g. "/subfolder", or empty at the root itself
   WORKDIR_IN="/workdir${REL}"
 fi
 
-docker run "${RUN_FLAGS[@]}" \
-  -v "$MOUNT_SRC":/workdir \
-  -v "$CONFIG_DIR":/home/claude/.claude \
-  -v "$SSH_DIR":/home/claude/.ssh \
+"${NOCONV[@]}" "${DOCKER_RUN[@]}" run "${RUN_FLAGS[@]}" \
+  -v "$(to_host_path "$MOUNT_SRC")":/workdir \
+  -v "$(to_host_path "$CONFIG_DIR")":/home/claude/.claude \
+  -v "$(to_host_path "$SSH_DIR")":/home/claude/.ssh \
   -w "$WORKDIR_IN" \
   "$IMAGE" "$@"

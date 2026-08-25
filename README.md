@@ -2,6 +2,17 @@
 
 Run [Claude Code](https://docs.claude.com/en/docs/claude-code) in a container, with `ccd` as a handy wrapper. The wrapper starts Docker automatically (colima / Docker Desktop / systemd), **builds the image locally from the `Dockerfile`** (so it works on arm64/macOS too), mounts your current directory and keeps your login between sessions.
 
+## Supported environments
+
+| Target | Shell | Docker runtime | Notes |
+| --- | --- | --- | --- |
+| **Linux** (x86_64 / arm64) | `bash`, `zsh`, `fish` | daemon via `systemd` (rootless works too) | the container takes over your host uid/gid, so bind-mounted files keep the right owner |
+| **macOS** (Intel / Apple Silicon) | `bash`, `zsh`, `fish` | [colima](https://github.com/abiosoft/colima) or Docker Desktop | the image is built locally, so arm64 needs no prebuilt image |
+| **Windows 10/11** | **Git Bash** only | Docker Desktop | started automatically; interactive sessions go through `winpty` — see [Windows / Git Bash](#windows--git-bash) |
+| **WSL2** | `bash`, `zsh`, `fish` | Docker Desktop WSL integration, or a daemon in the distro | counts as Linux; run `ccd` from inside WSL, not from Git Bash |
+
+PowerShell and `cmd` are not supported — on Windows use Git Bash.
+
 ## Quick start
 
 Install (no clone needed) and run:
@@ -9,6 +20,8 @@ Install (no clone needed) and run:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ridiekel/symmetrical-enigma/main/install.sh | sh
 ```
+
+Starting the container
 
 ```bash
 ccd                 # interactive Claude Code session in the current directory
@@ -39,6 +52,21 @@ host uid/gid (via `ccd`), so files in bind mounts get the right owner.
 - `bash` plus `curl` or `wget` (for the installer and the auto-update)
 - macOS: [colima](https://github.com/abiosoft/colima) (`brew install colima`) **or** Docker Desktop
 - Linux: a Docker daemon (started via `systemd`)
+- Windows: Docker Desktop, run from **Git Bash** (see below)
+
+### Windows / Git Bash
+
+`ccd` runs in Git Bash (MSYS); PowerShell and `cmd` are not supported. Two things are
+worth knowing:
+
+- **Docker Desktop** is the runtime. `ccd` starts it automatically when it isn't running
+  yet — it looks in `%ProgramFiles%\\Docker\\Docker\\` and `%LOCALAPPDATA%\\Docker\\`. For a
+  non-standard installation, point `CCD_DOCKER_DESKTOP` at `Docker Desktop.exe`.
+- **`winpty`** (ships with Git for Windows) is used automatically for interactive
+  sessions; without it Docker refuses the TTY with *"the input device is not a TTY"*.
+
+Your project has to live on a drive Docker Desktop can share (the default `C:` is fine).
+For repositories inside WSL, run `ccd` from WSL itself rather than from Git Bash.
 
 ## Installation
 
@@ -201,6 +229,10 @@ or `docker compose`). Because Claude Code already runs *in* a container, `ccd` o
 modes for that via a startup flag. The `docker` CLI, the daemon binaries and the compose plugin
 are already in the image.
 
+Both modes are **opt-in per run**. Without a flag the container is unprivileged and has no
+Docker access at all: no socket is mounted and no daemon runs, so the `docker` CLI in the
+image has nothing to talk to.
+
 | Flag | Mode | What it does |
 | ---- | ---- | ------------ |
 | `--docker` or `--docker=host` | **DooD** (Docker-outside-of-Docker) | Mounts the host Docker socket; testcontainers run as *siblings* on the host daemon. |
@@ -215,6 +247,24 @@ The flag goes before the arguments for `claude`; everything else `ccd` passes th
 ccd --docker -p "run the integration tests"   # host daemon (DooD)
 ccd --dind   -p "run the integration tests"   # own daemon (DinD)
 ```
+
+> **Note (security): neither mode is a boundary against your machine.** DooD hands the
+> container the host Docker socket, and with it the ability to start a privileged container
+> on the host daemon. DinD needs `--privileged` because a real `dockerd` has to mount the
+> overlay storage driver, write to `/sys/fs/cgroup`, set up `iptables`/bridge networking and
+> reach an unmasked `/proc` — a default container is denied all four. Both are effectively
+> root on the host, so choose a mode for **isolation**, not for safety:
+
+| | DooD (`--docker`) | DinD (`--dind`) |
+| --- | --- | --- |
+| Image/container store | shared with the host — Claude can see, stop and prune the containers you are running yourself | separate, in the `claude-dind-data` volume |
+| Speed and disk | reuses the host image cache | pulls every image again |
+| Lifetime | containers outlive the `ccd` session | daemon and containers disappear with the session |
+
+Removing `--privileged` from DinD doesn't make it safer — it stops working. `dockerd` fails
+during startup, the entrypoint waits 30 seconds, dumps the daemon log and exits. Unprivileged
+DinD would need rootless `dockerd` (`/dev/fuse`, cgroup delegation, unconfined
+seccomp/apparmor) or the [sysbox](https://github.com/nestybox/sysbox) runtime on the host.
 
 **DooD (`--docker`)** — fast, and shares images with the host:
 
@@ -232,8 +282,6 @@ ccd --dind   -p "run the integration tests"   # own daemon (DinD)
    `localhost` and the Ryuk reaper works.
 4. **macOS**: sets `TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal`,
    so testcontainers finds the started containers via the host.
-
-> **Note (security):** socket access effectively gives the container root privileges on the host.
 
 **DinD (`--dind`)** — fully isolated from the host Docker:
 
@@ -254,9 +302,9 @@ unused volumes in the store) and then exits — *no* Claude session is started.
 The volume itself keeps existing (now empty). To remove it entirely, you can also run
 `docker volume rm claude-dind-data` on the host.
 
-> **Note:** DinD does *not* touch the host Docker, but `--privileged` is a host privilege
-> in its own right. The internal daemon (and everything the tests start) disappears when the
-> ccd session stops; only the image volume remains.
+> **Note:** DinD does *not* touch the host Docker. The internal daemon (and everything the
+> tests start) disappears when the ccd session stops; only the image volume remains. See the
+> security note above for why `--privileged` is needed.
 
 > **Bind mounts from the tests (DooD only):** in DooD, containers run on the
 > host daemon, so a bind mount to a path *in* the ccd container (e.g. `/workdir/...`)

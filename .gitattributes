@@ -1,0 +1,6 @@
+# Keep the shell scripts LF, also on Windows checkouts: a CRLF in ccd/entrypoint.sh
+# breaks bash ("$\r: command not found") and the container ENTRYPOINT.
+* text=auto eol=lf
+ccd text eol=lf
+*.sh text eol=lf
+Dockerfile text eol=lf
