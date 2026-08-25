@@ -1,0 +1,7 @@
+# JetBrains IDE
+.idea/
+
+# QEMU/colima crash dumps
+*.core
+*Zone.Identifier
+.claude

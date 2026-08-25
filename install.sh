@@ -1,0 +1,183 @@
+#!/bin/sh
+# Installer for 'ccd' (Claude Code in Docker).
+#
+#   Remote (no clone needed):
+#     curl -fsSL https://raw.githubusercontent.com/ridiekel/symmetrical-enigma/main/install.sh | sh
+#
+#   From a clone (dev mode): ./install.sh
+#
+# POSIX sh on purpose, so '| sh' works as well as '| bash'.
+set -eu
+
+CMD_NAME="ccd"
+
+# Which repo/branch we install from (override for a fork or a test branch).
+REPO="${CCD_REPO:-ridiekel/symmetrical-enigma}"
+BRANCH="${CCD_BRANCH:-main}"
+# Escape hatch: install from another host (mirror, GitLab raw, a local dir via file://).
+RAW_BASE="${CCD_RAW_BASE:-https://raw.githubusercontent.com/$REPO/$BRANCH}"
+
+# Files ccd needs at runtime: itself plus the build files for the local image.
+FILES="ccd Dockerfile entrypoint.sh"
+
+# Where the files land in remote mode, and where the command goes on PATH.
+CCD_HOME="${CCD_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/ccd}"
+BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
+
+# ---------------------------------------------------------------------------
+# Local (clone) or remote (curl | sh)?
+# ---------------------------------------------------------------------------
+# When piped, $0 is 'sh'/'bash' and there is no directory with sources next to us.
+resolve_dir() {
+  _self="$0"
+  # Follow symlinks, so './install.sh' also works via a link.
+  if command -v readlink >/dev/null 2>&1; then
+    while [ -L "$_self" ]; do
+      _dir="$(cd -P "$(dirname "$_self")" 2>/dev/null && pwd)" || break
+      _self="$(readlink "$_self")"
+      case "$_self" in /*) ;; *) _self="$_dir/$_self" ;; esac
+    done
+  fi
+  case "$_self" in
+    */*) _dir="$(dirname "$_self")" ;;
+    *)   if [ -f "./$_self" ]; then _dir="."; else return 1; fi ;;
+  esac
+  (cd -P "$_dir" 2>/dev/null && pwd) || return 1
+}
+
+SRC_DIR="$(resolve_dir || true)"
+if [ -n "${SRC_DIR:-}" ] && [ -f "$SRC_DIR/ccd" ] && [ -f "$SRC_DIR/Dockerfile" ]; then
+  MODE="local"
+else
+  MODE="remote"
+  SRC_DIR="$CCD_HOME"
+fi
+
+# ---------------------------------------------------------------------------
+# Remote mode: fetch the files into $CCD_HOME
+# ---------------------------------------------------------------------------
+fetch() {
+  # $1 = url, $2 = target file
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 5 --max-time 60 "$1" -o "$2"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --timeout=60 -O "$2" "$1"
+  else
+    echo "Neither curl nor wget found — cannot download." >&2
+    exit 1
+  fi
+}
+
+if [ "$MODE" = "remote" ]; then
+  command -v bash >/dev/null 2>&1 || echo "Warning: 'bash' not found — 'ccd' itself needs bash." >&2
+
+  echo "Installing $CMD_NAME from $REPO@$BRANCH into $CCD_HOME ..."
+  mkdir -p "$CCD_HOME"
+
+  # Download everything to a temp dir first, so a failed download never leaves
+  # a half-updated installation behind.
+  TMP="$(mktemp -d)"
+  trap 'rm -rf "$TMP"' EXIT INT TERM
+  for f in $FILES; do
+    echo "  - $f"
+    fetch "$RAW_BASE/$f" "$TMP/$f"
+    [ -s "$TMP/$f" ] || { echo "Empty download: $f" >&2; exit 1; }
+  done
+  for f in $FILES; do
+    mv -f "$TMP/$f" "$CCD_HOME/$f"
+  done
+
+  # ccd reads this back for its own auto-update, so a fork keeps updating from the fork.
+  printf 'repo=%s\nbranch=%s\n' "$REPO" "$BRANCH" > "$CCD_HOME/.ccd-source"
+  [ -n "${CCD_RAW_BASE:-}" ] && printf 'raw_base=%s\n' "$CCD_RAW_BASE" >> "$CCD_HOME/.ccd-source"
+fi
+
+SRC_SCRIPT="$SRC_DIR/$CMD_NAME"
+if [ ! -f "$SRC_SCRIPT" ]; then
+  echo "Cannot find '$CMD_NAME' in $SRC_DIR." >&2
+  exit 1
+fi
+chmod +x "$SRC_SCRIPT"
+
+# ---------------------------------------------------------------------------
+# Put the command on PATH (a symlink, so updates are picked up automatically)
+# ---------------------------------------------------------------------------
+mkdir -p "$BIN_DIR"
+LINK="$BIN_DIR/$CMD_NAME"
+
+# Already installed? Repointing a symlink is harmless — the old target (your clone, say)
+# keeps all its files. A *real* file there is someone's own copy/script, so we move that
+# aside instead of silently throwing it away.
+if [ -e "$LINK" ] && [ ! -L "$LINK" ]; then
+  BACKUP="$LINK.backup-$(date +%Y%m%d%H%M%S)"
+  mv "$LINK" "$BACKUP"
+  echo "Existing file moved aside: $BACKUP"
+elif [ -L "$LINK" ]; then
+  OLD_TARGET="$(readlink "$LINK" 2>/dev/null || true)"
+  if [ -n "$OLD_TARGET" ] && [ "$OLD_TARGET" != "$SRC_SCRIPT" ]; then
+    echo "Replacing the existing link (pointed to $OLD_TARGET — that copy stays untouched)"
+  fi
+fi
+
+ln -sf "$SRC_SCRIPT" "$LINK"
+echo "Symlink: $LINK -> $SRC_SCRIPT"
+
+if [ "$MODE" = "local" ]; then
+  echo "(local mode: linked to your working copy — auto-update stays off for a git checkout)"
+fi
+
+# Is BIN_DIR already in PATH? Then we're done.
+case ":${PATH}:" in
+  *":${BIN_DIR}:"*)
+    echo "$BIN_DIR is already in PATH. Done — use '$CMD_NAME'."
+    exit 0
+    ;;
+esac
+
+MARKER="# added by ccd install.sh"
+
+append_once() {
+  # $1 = file, $2 = line to append
+  file="$1"; line="$2"
+  mkdir -p "$(dirname "$file")"
+  [ -f "$file" ] || touch "$file"
+  if grep -qF "$MARKER" "$file" 2>/dev/null; then
+    echo "PATH line was already in $file"
+  else
+    printf '\n%s\n%s\n' "$MARKER" "$line" >> "$file"
+    echo "PATH added to $file"
+  fi
+}
+
+OS="$(uname -s)"
+POSIX_LINE="export PATH=\"$BIN_DIR:\$PATH\""
+
+case "$(basename "${SHELL:-sh}")" in
+  zsh)
+    RC="$HOME/.zshrc"
+    append_once "$RC" "$POSIX_LINE"
+    ;;
+  bash)
+    # macOS Terminal starts login shells (.bash_profile); Linux uses .bashrc
+    if [ "$OS" = "Darwin" ]; then
+      RC="$HOME/.bash_profile"
+    elif [ -f "$HOME/.bashrc" ]; then
+      RC="$HOME/.bashrc"
+    else
+      RC="$HOME/.profile"
+    fi
+    append_once "$RC" "$POSIX_LINE"
+    ;;
+  fish)
+    RC="$HOME/.config/fish/config.fish"
+    append_once "$RC" "fish_add_path \"$BIN_DIR\""
+    ;;
+  *)
+    RC="$HOME/.profile"
+    append_once "$RC" "$POSIX_LINE"
+    ;;
+esac
+
+echo
+echo "Done. Open a new shell or run:  source \"$RC\""
+echo "After that '$CMD_NAME' works everywhere."

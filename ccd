@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# The original arguments, before we parse ccd's own flags out of them. Needed to
+# re-exec ourselves after an auto-update (see self_update below).
+ORIG_ARGS=("$@")
+
+# Determine the directory of *this* script (follows symlinks; install.sh puts 'ccd' as a
+# symlink on PATH). That way we find the Dockerfile, even when 'ccd' is called from outside the repo.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [ "${SOURCE#/}" = "$SOURCE" ] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+
+# Parse ccd's own startup args; everything else is passed through to 'claude' unchanged.
+#   --docker            Docker-in-Docker in DooD mode (host socket; siblings on the host daemon)
+#   --docker=host       same
+#   --docker=dind  / --dind   own Docker daemon *in* the container (fully isolated)
+#   --prune                   clean up the DinD image store (implies --dind) and exit afterwards
+#   --rebuild                 force a clean rebuild of the local image and afterwards
+#                             clean up the old images/build cache (volumes are kept)
+#   --no-update               skip the auto-update check against GitHub for this run
+DOCKER_MODE=""
+PRUNE=0
+REBUILD=0
+NO_UPDATE=0
+CLAUDE_ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --docker)    DOCKER_MODE="host" ;;
+    --docker=*)  DOCKER_MODE="${1#--docker=}" ;;
+    --dind)      DOCKER_MODE="dind" ;;
+    --prune)     PRUNE=1 ;;
+    --rebuild)   REBUILD=1 ;;
+    --no-update) NO_UPDATE=1 ;;
+    --)          shift; CLAUDE_ARGS+=("$@"); break ;;
+    *)           CLAUDE_ARGS+=("$1") ;;
+  esac
+  shift
+done
+set -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}"
+
+# --prune works on the images in the DinD volume, so we always run in DinD mode.
+[ "$PRUNE" = "1" ] && DOCKER_MODE="dind"
+
+# ---------------------------------------------------------------------------
+# Auto-update from GitHub
+# ---------------------------------------------------------------------------
+# The installer drops 'ccd', 'Dockerfile' and 'entrypoint.sh' in ~/.local/share/ccd, so no
+# cloned repo is needed. On every start we compare those files with the raw files on GitHub
+# and replace whatever differs:
+#   * changed Dockerfile/entrypoint.sh -> the build-hash check further down rebuilds the image;
+#   * a changed 'ccd'                  -> we re-exec ourselves, so the update applies right away.
+#
+# Fails soft: no network, no curl/wget or a GitHub hiccup simply means we keep running with
+# the version we already have. Skipped for a git checkout ($SCRIPT_DIR/.git) — there your own
+# working copy wins. Off with --no-update / CCD_NO_UPDATE=1; CCD_UPDATE_INTERVAL=<seconds>
+# limits how often we check (default 0 = every start).
+UPDATE_FILES="ccd Dockerfile entrypoint.sh"
+
+fetch_url() {
+  # $1 = url, $2 = target file. Errors stay quiet: a failed update check must not
+  # spam the start of a session (we simply keep the current version).
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 5 --max-time 30 "$1" -o "$2" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --timeout=30 -O "$2" "$1" 2>/dev/null
+  else
+    return 1
+  fi
+}
+
+self_update() {
+  [ "$NO_UPDATE" = "1" ] && return 0
+  [ -n "${CCD_NO_UPDATE:-}" ] && return 0
+  [ -n "${CCD_UPDATED:-}" ] && return 0     # we already restarted once this run
+  [ -d "$SCRIPT_DIR/.git" ] && return 0     # git checkout: don't touch the working copy
+  [ -w "$SCRIPT_DIR" ] || return 0
+
+  # Where to update from: the environment wins, then the .ccd-source that install.sh
+  # wrote (so an installation from a fork keeps following that fork), then the default.
+  local repo="${CCD_REPO:-}" branch="${CCD_BRANCH:-}"
+  if [ -f "$SCRIPT_DIR/.ccd-source" ]; then
+    [ -z "$repo" ]   && repo="$(sed -n 's/^repo=//p'   "$SCRIPT_DIR/.ccd-source" | head -n1)"
+    [ -z "$branch" ] && branch="$(sed -n 's/^branch=//p' "$SCRIPT_DIR/.ccd-source" | head -n1)"
+  fi
+  repo="${repo:-ridiekel/symmetrical-enigma}"
+  branch="${branch:-main}"
+
+  # Escape hatch: point the update check at another host entirely (mirror, GitLab raw, a
+  # local directory via file://). Env wins over the value install.sh recorded.
+  local raw_base="${CCD_RAW_BASE:-}"
+  if [ -z "$raw_base" ] && [ -f "$SCRIPT_DIR/.ccd-source" ]; then
+    raw_base="$(sed -n 's/^raw_base=//p' "$SCRIPT_DIR/.ccd-source" | head -n1)"
+  fi
+
+  # Optional throttle, so you can check less often than every start.
+  local stamp="$SCRIPT_DIR/.last-update-check" interval="${CCD_UPDATE_INTERVAL:-0}"
+  if [ "$interval" -gt 0 ] 2>/dev/null && [ -f "$stamp" ]; then
+    local last now
+    last="$(stat -c %Y "$stamp" 2>/dev/null || stat -f %m "$stamp" 2>/dev/null || echo 0)"
+    now="$(date +%s)"
+    [ $(( now - last )) -lt "$interval" ] && return 0
+  fi
+
+  local tmp base f changed=""
+  tmp="$(mktemp -d)" || return 0
+  base="${raw_base:-https://raw.githubusercontent.com/$repo/$branch}"
+
+  # First download everything; only apply when the whole set came through, so a failed
+  # download never leaves a half-updated installation behind.
+  for f in $UPDATE_FILES; do
+    if ! fetch_url "$base/$f" "$tmp/$f" || [ ! -s "$tmp/$f" ]; then
+      rm -rf "$tmp"
+      return 0
+    fi
+  done
+  : > "$stamp" 2>/dev/null || true
+
+  # Sanity check on the fetched shell scripts: a truncated download or an unexpected
+  # error page must never replace a working ccd/entrypoint.
+  for f in ccd entrypoint.sh; do
+    if [ "$(head -n1 "$tmp/$f" | cut -c1-2)" != "#!" ] || ! bash -n "$tmp/$f" 2>/dev/null; then
+      echo "Update ignored: the downloaded '$f' is not a valid script." >&2
+      rm -rf "$tmp"
+      return 0
+    fi
+  done
+
+  for f in $UPDATE_FILES; do
+    cmp -s "$tmp/$f" "$SCRIPT_DIR/$f" || changed="$changed $f"
+  done
+  if [ -z "$changed" ]; then
+    rm -rf "$tmp"
+    return 0
+  fi
+
+  echo "Update found (${raw_base:-$repo@$branch}):${changed} — installing..."
+  for f in $changed; do
+    # 'mv' (rename) instead of writing over the file: bash keeps reading the *running*
+    # script from its old inode, so overwriting in place would corrupt this session.
+    mv -f "$tmp/$f" "$SCRIPT_DIR/$f"
+  done
+  chmod +x "$SCRIPT_DIR/ccd" 2>/dev/null || true
+  rm -rf "$tmp"
+
+  case " $changed " in
+    *" ccd "*)
+      echo "Restarting with the updated ccd..."
+      CCD_UPDATED=1 exec "$SCRIPT_DIR/ccd" "${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}"
+      ;;
+  esac
+}
+
+self_update
+
+# Default: build locally from the Dockerfile next to this script. That works on
+# arm64/macOS too, where there is no ready-made arm64 image in the registry.
+# Set CLAUDE_IMAGE to use an existing image instead of building.
+if [ -n "${CLAUDE_IMAGE:-}" ]; then
+  IMAGE="$CLAUDE_IMAGE"
+  BUILD_LOCAL=0
+else
+  IMAGE="claude-code:local"
+  BUILD_LOCAL=1
+fi
+
+CONFIG_DIR="${HOME}/.config/claude-docker"
+mkdir -p "$CONFIG_DIR"
+
+# Persistent, container-owned SSH directory (separate from the host ~/.ssh). It keeps an
+# own SSH key *and* known_hosts across --rm runs, so git-over-ssh keeps working.
+SSH_DIR="$CONFIG_DIR/ssh"
+mkdir -p "$SSH_DIR"
+chmod 700 "$SSH_DIR"
+
+OS="$(uname -s)"
+
+docker_running() {
+  docker info >/dev/null 2>&1
+}
+
+wait_for_docker() {
+  echo "Waiting for Docker to become available..."
+  for _ in $(seq 1 30); do
+    if docker_running; then
+      echo "Docker is up."
+      return 0
+    fi
+    sleep 1
+  done
+  echo "Docker did not start within the timeout." >&2
+  return 1
+}
+
+start_docker() {
+  case "$OS" in
+    Darwin)
+      if command -v colima >/dev/null 2>&1; then
+        echo "Starting Colima..."
+        colima start
+      elif [ -d /Applications/Docker.app ]; then
+        echo "Starting Docker Desktop..."
+        open -a Docker
+      else
+        echo "No Docker runtime found. Install colima (brew install colima) or Docker Desktop." >&2
+        exit 1
+      fi
+      ;;
+    Linux)
+      if command -v systemctl >/dev/null 2>&1; then
+        echo "Starting the Docker daemon via systemd..."
+        sudo systemctl start docker
+      else
+        echo "Cannot start Docker automatically (no systemd). Start the daemon manually." >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "Unsupported OS: $OS" >&2
+      exit 1
+      ;;
+  esac
+}
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "docker CLI not found in PATH." >&2
+  exit 1
+fi
+
+if ! docker_running; then
+  start_docker
+  wait_for_docker
+fi
+
+# Build the local image if needed. We only build when the image doesn't exist yet,
+# when the build files (Dockerfile/entrypoint.sh) have changed, or when a rebuild is
+# forced via --rebuild or CLAUDE_REBUILD. That keeps a repeated 'ccd' fast.
+if [ "$BUILD_LOCAL" = "1" ]; then
+  sha_cmd() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi
+  }
+  build_hash() {
+    cat "$SCRIPT_DIR/Dockerfile" "$SCRIPT_DIR/entrypoint.sh" | sha_cmd | awk '{print $1}'
+  }
+  HASH_FILE="$CONFIG_DIR/.image-hash"
+
+  # Max age of the local image in days. If the image is older, we periodically force
+  # a clean rebuild so the latest Claude Code + base-image/apt updates get pulled again.
+  # Set CCD_IMAGE_MAX_AGE_DAYS=0 to disable this.
+  MAX_AGE_DAYS="${CCD_IMAGE_MAX_AGE_DAYS:-10}"
+
+  # Days since the last local build, derived from the mtime of the build marker
+  # ($HASH_FILE is rewritten after *every* build, so its mtime = last build time).
+  # Portable: GNU 'stat -c %Y' with a BSD/macOS 'stat -f %m' fallback.
+  image_age_days() {
+    local mtime now
+    mtime="$(stat -c %Y "$HASH_FILE" 2>/dev/null || stat -f %m "$HASH_FILE" 2>/dev/null)" || return 1
+    now="$(date +%s)"
+    echo $(( (now - mtime) / 86400 ))
+  }
+
+  # --rebuild and CLAUDE_REBUILD do the same thing: a forced rebuild.
+  [ -n "${CLAUDE_REBUILD:-}" ] && REBUILD=1
+
+  needs_build=0
+  if [ "$REBUILD" = "1" ]; then
+    needs_build=1
+  elif ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    needs_build=1
+  elif [ ! -f "$HASH_FILE" ] || [ "$(cat "$HASH_FILE")" != "$(build_hash)" ]; then
+    needs_build=1
+  elif [ "$MAX_AGE_DAYS" -gt 0 ] 2>/dev/null && age="$(image_age_days)" && [ "$age" -ge "$MAX_AGE_DAYS" ]; then
+    # The image is there and up to date as far as the build files go, but it is too old. A
+    # normal (cached) rebuild would reuse the npm layer and therefore refresh nothing, so we
+    # do a full --rebuild (--no-cache + cleanup) to pull everything again.
+    echo "Image is ${age} days old (max ${MAX_AGE_DAYS}) — clean rebuild to refresh everything..."
+    REBUILD=1
+    needs_build=1
+  fi
+
+  if [ "$needs_build" = "1" ]; then
+    # With --rebuild we build without cache, so it really is a clean build.
+    BUILD_OPTS=()
+    [ "$REBUILD" = "1" ] && BUILD_OPTS+=(--no-cache)
+
+    echo "Building image ($IMAGE) — the first time this can take a while..."
+    docker build "${BUILD_OPTS[@]+"${BUILD_OPTS[@]}"}" -t "$IMAGE" "$SCRIPT_DIR"
+    build_hash > "$HASH_FILE"
+
+    # After a forced rebuild, clean up the leftovers: the previous image now
+    # hangs around as a dangling '<none>' image, plus unused build cache layers.
+    # We deliberately do NOT touch any volumes (claude-dind-data and friends stay).
+    if [ "$REBUILD" = "1" ]; then
+      echo "Cleaning up old images and build cache (volumes are kept)..."
+      docker image prune -f >/dev/null 2>&1 || true
+      docker builder prune -f >/dev/null 2>&1 || true
+    fi
+  fi
+fi
+
+# Build the flags conditionally:
+#  -t only with a real TTY (otherwise piping/CI breaks)
+#  ANTHROPIC_API_KEY only forwarded when it is set, so an empty value
+#  doesn't overwrite an OAuth login in the mounted ~/.claude.
+RUN_FLAGS=(--rm -i)
+[ -t 0 ] && RUN_FLAGS+=(-t)
+[ -n "${ANTHROPIC_API_KEY:-}" ] && RUN_FLAGS+=(-e ANTHROPIC_API_KEY)
+
+# Forward the GitHub token so 'gh' (api/pr/...) is authenticated right away. In a
+# --rm container there is no 'gh auth login' state, so without a token every gh call fails.
+# Forward both names: gh accepts GH_TOKEN *and* GITHUB_TOKEN; only when they are set.
+[ -n "${GH_TOKEN:-}" ] && RUN_FLAGS+=(-e GH_TOKEN)
+[ -n "${GITHUB_TOKEN:-}" ] && RUN_FLAGS+=(-e GITHUB_TOKEN)
+
+# Forward the terminal environment so colors/terminfo are correct in the container.
+for var in TERM COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION; do
+  [ -n "${!var:-}" ] && RUN_FLAGS+=(-e "$var")
+done
+
+# Copy-paste fix: Claude Code enables full mouse tracking by default
+# (ESC[?1000h + ESC[?1006h). As long as that mouse mode is active, the macOS terminal
+# hands your drag actions to the TUI instead of making its own selection — which leaves
+# "Copy" in the terminal menu greyed out and makes Cmd+C do nothing. CLAUDE_CODE_DISABLE_MOUSE=1
+# turns the mouse mode off, so normal text selection + copying work again.
+# (Trade-off: no more mouse-wheel scrolling in the TUI; scroll via Shift+PgUp/keys.)
+# Respect a value set by the user; off by default.
+RUN_FLAGS+=(-e CLAUDE_CODE_DISABLE_MOUSE="${CLAUDE_CODE_DISABLE_MOUSE:-1}")
+
+# Scrollback fix: in the container Claude Code detects a non-standard TTY and turns on its
+# fullscreen renderer (alternate screen buffer, like vim/htop). As a result, earlier output
+# doesn't end up in your terminal's native scrollback — you only see what fits on screen.
+# CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 forces the classic renderer, which draws inline in the
+# normal buffer so scrolling through the history works like it does in a native run.
+# (In-session you switch with '/tui default' <-> '/tui fullscreen'.) It combines nicely with the
+# mouse toggle above: mouse wheel/Shift+PgUp then scroll the native buffer.
+# Respect a value set by the user; on by default.
+RUN_FLAGS+=(-e CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN="${CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-1}")
+
+# On Linux: let the container user take over the host uid/gid, so files in
+# bind mounts get the right owner. On macOS Docker handles this itself.
+if [ "$OS" = "Linux" ]; then
+  RUN_FLAGS+=(-e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)")
+fi
+
+# Docker-in-Docker for tests (testcontainers, docker compose, ...). Mode via a ccd flag:
+#   --docker | --docker=host  -> DooD: mount the host Docker socket; containers run as
+#                                siblings on the host daemon. Fast, shares images with the host.
+#                                NOTE: socket access = effectively root on the host.
+#   --docker=dind | --dind    -> DinD: its own daemon *in* the container, separate from the host.
+#                                Fully isolated, but requires --privileged.
+case "$DOCKER_MODE" in
+  "")
+    : # off
+    ;;
+  dind)
+    RUN_FLAGS+=(--privileged -e CCD_DOCKER_MODE=dind)
+    # Persistent daemon data so pulled images are kept between runs
+    # (and /var/lib/docker isn't on the container's overlay layer).
+    RUN_FLAGS+=(-v claude-dind-data:/var/lib/docker)
+    # --prune: after starting dockerd, the entrypoint cleans up the store and then exits.
+    [ "$PRUNE" = "1" ] && RUN_FLAGS+=(-e CCD_PRUNE=1)
+    ;;
+  *) # 1, host, dood, ...
+    ctx_host="$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)"
+    if [ "$OS" = "Linux" ]; then
+      # On Linux the daemon runs on the host: mount the real socket path. We ask
+      # the active docker context for the endpoint (rootless uses e.g.
+      # $XDG_RUNTIME_DIR/docker.sock) and fall back to the default path.
+      HOST_SOCK=""
+      env_host="${DOCKER_HOST:-}"
+      for cand in "${ctx_host#unix://}" "${env_host#unix://}" /var/run/docker.sock; do
+        if [ -n "$cand" ] && [ -S "$cand" ]; then HOST_SOCK="$cand"; break; fi
+      done
+      if [ -z "$HOST_SOCK" ]; then
+        echo "--docker=$DOCKER_MODE (DooD), but no Docker socket was found" >&2
+        echo "(context endpoint: ${ctx_host:-unknown}). Use --dind for an own daemon in the container." >&2
+        exit 1
+      fi
+      RUN_FLAGS+=(-v "$HOST_SOCK":/var/run/docker.sock)
+      # Share the host network stack so the ports testcontainers publishes are reachable
+      # via localhost from the container (and the Ryuk reaper works).
+      RUN_FLAGS+=(--network host)
+    else
+      # macOS: the daemon runs in a VM (Docker Desktop or Colima). The host path from
+      # the context — e.g. Colima's ~/.colima/<profile>/docker.sock — can NOT serve as a
+      # bind source: that path lives under $HOME and is resolved into the VM via virtiofs,
+      # where no unix socket can be created
+      # ("mkdir ... operation not supported"). Both runtimes *do* special-case
+      # /var/run/docker.sock to the real daemon socket in the VM, so that's what we mount.
+      if [ -z "$ctx_host" ] && [ -z "${DOCKER_HOST:-}" ]; then
+        echo "--docker=$DOCKER_MODE (DooD), but no Docker daemon is reachable" >&2
+        echo "Start Docker Desktop or Colima (colima start), or use --dind." >&2
+        exit 1
+      fi
+      RUN_FLAGS+=(-v /var/run/docker.sock:/var/run/docker.sock)
+      # No host networking on macOS; host.docker.internal points to the host, so
+      # testcontainers connects via the published ports.
+      RUN_FLAGS+=(-e TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal)
+    fi
+    ;;
+esac
+
+# Determine what we mount. If we're in a git repo, mount the repo root (so the
+# .git directory comes along into the container and commit/push work) and set the working
+# directory to the subfolder where you ran 'ccd'. Outside a repo: just $PWD as before.
+MOUNT_SRC="$PWD"
+WORKDIR_IN="/workdir"
+if GIT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  MOUNT_SRC="$GIT_ROOT"
+  REL="${PWD#"$GIT_ROOT"}"          # e.g. "/subfolder", or empty at the root itself
+  WORKDIR_IN="/workdir${REL}"
+fi
+
+docker run "${RUN_FLAGS[@]}" \
+  -v "$MOUNT_SRC":/workdir \
+  -v "$CONFIG_DIR":/home/claude/.claude \
+  -v "$SSH_DIR":/home/claude/.ssh \
+  -w "$WORKDIR_IN" \
+  "$IMAGE" "$@"
