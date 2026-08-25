@@ -60,10 +60,12 @@ to_unix_path() {
 #   --rebuild                 force a clean rebuild of the local image and afterwards
 #                             clean up the old images/build cache (volumes are kept)
 #   --no-update               skip the auto-update check against GitHub for this run
+#   --no-clipboard            don't set up the host clipboard bridge (image paste)
 DOCKER_MODE=""
 PRUNE=0
 REBUILD=0
 NO_UPDATE=0
+NO_CLIPBOARD=0
 CLAUDE_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -73,6 +75,7 @@ while [ $# -gt 0 ]; do
     --prune)     PRUNE=1 ;;
     --rebuild)   REBUILD=1 ;;
     --no-update) NO_UPDATE=1 ;;
+    --no-clipboard) NO_CLIPBOARD=1 ;;
     --)          shift; CLAUDE_ARGS+=("$@"); break ;;
     *)           CLAUDE_ARGS+=("$1") ;;
   esac
@@ -481,6 +484,230 @@ case "$DOCKER_MODE" in
     fi
     ;;
 esac
+
+# ---------------------------------------------------------------------------
+# Clipboard bridge (image paste)
+# ---------------------------------------------------------------------------
+# Ctrl+V with an image on the clipboard doesn't send the image through the terminal:
+# Claude Code reads the *system* clipboard itself. On Linux — which is what it sees
+# inside this container — it does that by shelling out to
+#   xclip -selection clipboard -t TARGETS -o     (is there an image?)
+#   xclip -selection clipboard -t image/png -o   (give me the bytes)
+# A container has no clipboard of its own and no path to the host's, so both calls fail
+# and the paste silently does nothing.
+#
+# The fix is a bridge, and the host side of it has to differ per platform (pbpaste-style
+# osascript on macOS, xclip/wl-paste on Linux, PowerShell on Windows and WSL). We keep the
+# *container* side identical everywhere: entrypoint.sh installs an 'xclip' shim in
+# /usr/local/bin that, instead of talking to an X server, drops a small request file in a
+# directory bind-mounted from the host. The loop below is what picks those up, runs the
+# platform's real clipboard command and writes the answer back.
+#
+# Deliberately file-based rather than a socket or a port: a bind mount is the one channel
+# that behaves the same on Docker Desktop (macOS/Windows), Colima and plain Linux, and the
+# poller needs nothing beyond the bash we're already running in.
+#
+# Off with --no-clipboard / CCD_NO_CLIPBOARD=1.
+CLIP_DIR=""
+CLIP_PID=""
+CLIP_MOUNT=/run/ccd-clipboard
+
+# Which host command can actually read the clipboard here. Sets CLIP_BACKEND directly
+# instead of echoing it: clip_find_powershell caches the interpreter path in PS_EXE, and
+# that would be lost again if we called this in a $(...) subshell.
+CLIP_BACKEND=none
+clip_detect_backend() {
+  CLIP_BACKEND=none
+  case "$OS" in
+    Darwin)
+      command -v osascript >/dev/null 2>&1 && CLIP_BACKEND=macos
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      clip_find_powershell && CLIP_BACKEND=windows
+      ;;
+    Linux)
+      # WSL first: WSLg does export DISPLAY/WAYLAND_DISPLAY, but what you copied in a
+      # Windows app lives on the *Windows* clipboard, which only PowerShell can reach.
+      if grep -qi microsoft /proc/version 2>/dev/null && clip_find_powershell; then
+        CLIP_BACKEND=wsl
+      elif [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-paste >/dev/null 2>&1; then
+        CLIP_BACKEND=wayland
+      elif [ -n "${DISPLAY:-}" ] && command -v xclip >/dev/null 2>&1; then
+        CLIP_BACKEND=x11
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# Locate powershell.exe (on PATH under Git Bash and, via the interop, under WSL too).
+PS_EXE=""
+clip_find_powershell() {
+  [ -n "$PS_EXE" ] && return 0
+  local cand
+  for cand in \
+    "${CCD_POWERSHELL:-}" \
+    "$(command -v powershell.exe 2>/dev/null || true)" \
+    /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe \
+    "/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+  do
+    if [ -n "$cand" ] && [ -x "$cand" ]; then PS_EXE="$cand"; return 0; fi
+  done
+  return 1
+}
+
+clip_ps() { "$PS_EXE" -NoProfile -NonInteractive -Sta -Command "$1"; }
+
+# Windows wants a Windows path for the file it has to read.
+clip_win_path() {
+  if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"
+  elif command -v wslpath >/dev/null 2>&1; then wslpath -w "$1"
+  else printf '%s\n' "$1"; fi
+}
+
+# --- the three operations, per backend -------------------------------------
+# clip_has_image           -> is there an image on the clipboard?
+# clip_read_image <file>   -> write it to <file> as PNG (or BMP; Claude Code accepts both)
+# clip_write_image <file>  -> put the PNG in <file> on the clipboard
+
+clip_has_image() {
+  case "$CLIP_BACKEND" in
+    macos)   osascript -e 'the clipboard as «class PNGf»' >/dev/null 2>&1 ;;
+    x11)     xclip -selection clipboard -t TARGETS -o 2>/dev/null | grep -qE 'image/(png|jpe?g|gif|webp|bmp)' ;;
+    wayland) wl-paste -l 2>/dev/null | grep -qE 'image/(png|jpe?g|gif|webp|bmp)' ;;
+    windows|wsl)
+      clip_ps 'Add-Type -AssemblyName System.Windows.Forms; if (-not [System.Windows.Forms.Clipboard]::ContainsImage()) { exit 1 }' >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+clip_read_image() {
+  local out="$1"
+  case "$CLIP_BACKEND" in
+    macos)
+      # 'on run argv' keeps the path out of the AppleScript source, so spaces and
+      # quotes in it can't break the script.
+      osascript \
+        -e 'on run argv' \
+        -e 'set d to (the clipboard as «class PNGf»)' \
+        -e 'set f to open for access POSIX file (item 1 of argv) with write permission' \
+        -e 'set eof f to 0' \
+        -e 'write d to f' \
+        -e 'close access f' \
+        -e 'end run' "$out" >/dev/null 2>&1 ;;
+    x11)
+      xclip -selection clipboard -t image/png -o > "$out" 2>/dev/null \
+        || xclip -selection clipboard -t image/bmp -o > "$out" 2>/dev/null ;;
+    wayland)
+      wl-paste --type image/png > "$out" 2>/dev/null \
+        || wl-paste --type image/bmp > "$out" 2>/dev/null ;;
+    windows|wsl)
+      clip_ps 'Add-Type -AssemblyName System.Windows.Forms; $i = [System.Windows.Forms.Clipboard]::GetImage(); if ($null -eq $i) { exit 1 }; $ms = New-Object System.IO.MemoryStream; $i.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); [Convert]::ToBase64String($ms.ToArray())' 2>/dev/null \
+        | tr -d '\r' | base64 -d > "$out" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+  [ -s "$out" ]
+}
+
+clip_write_image() {
+  local in="$1" win
+  [ -s "$in" ] || return 1
+  case "$CLIP_BACKEND" in
+    macos)
+      osascript \
+        -e 'on run argv' \
+        -e 'set the clipboard to (read (POSIX file (item 1 of argv)) as «class PNGf»)' \
+        -e 'end run' "$in" >/dev/null 2>&1 ;;
+    x11)     xclip -selection clipboard -t image/png -i < "$in" >/dev/null 2>&1 ;;
+    wayland) wl-copy --type image/png < "$in" >/dev/null 2>&1 ;;
+    windows|wsl)
+      win="$(clip_win_path "$in")"
+      clip_ps "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; \$img = [System.Drawing.Image]::FromFile('${win//\'/\'\'}'); [System.Windows.Forms.Clipboard]::SetImage(\$img); \$img.Dispose()" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The poller. One request = the files <id>.op (+ <id>.payload for a write) followed by an
+# empty <id>.req marker; we answer with <id>.out and finally <id>.rc, which is what the
+# shim waits for. Writing .rc last is the whole synchronisation: it only appears once the
+# payload is complete, so the shim can never read a half-written file.
+clip_bridge_loop() {
+  set +e                                  # a failing clipboard call must not kill the loop
+  local marker id op rc
+  while [ -d "$CLIP_DIR" ]; do
+    for marker in "$CLIP_DIR"/*.req; do
+      [ -e "$marker" ] || continue
+      id="${marker%.req}"
+      op="$(cat "$id.op" 2>/dev/null)"
+      rc=1
+      case "$op" in
+        targets) clip_has_image && { printf 'image/png\n' > "$id.out"; rc=0; } ;;
+        read)    clip_read_image "$id.out" && rc=0 ;;
+        write)   clip_write_image "$id.payload" && rc=0 ;;
+      esac
+      [ -f "$id.out" ] || : > "$id.out"
+      rm -f "$marker"
+      printf '%s\n' "$rc" > "$id.rc"
+    done
+    sleep 0.1
+  done
+}
+
+# Runs from the EXIT trap, where 'set -e' is still active — so no '&&' chains that could
+# abort the trap halfway and leave the bridge directory behind.
+clip_bridge_stop() {
+  if [ -n "$CLIP_PID" ]; then kill "$CLIP_PID" 2>/dev/null || true; fi
+  if [ -n "$CLIP_DIR" ]; then rm -rf "$CLIP_DIR" 2>/dev/null || true; fi
+  return 0
+}
+
+clip_bridge_start() {
+  [ "$NO_CLIPBOARD" = "1" ] && return 0
+  [ -n "${CCD_NO_CLIPBOARD:-}" ] && return 0
+
+  clip_detect_backend
+  if [ "$CLIP_BACKEND" = "none" ]; then
+    # Only worth mentioning to someone sitting at a terminal — a headless/CI run has no
+    # clipboard to bridge and shouldn't get a warning every time.
+    if [ -t 0 ]; then
+      echo "Note: no host clipboard tool found — pasting images into Claude Code won't work." >&2
+      case "$OS" in
+        Linux) echo "      On Linux install xclip (X11) or wl-clipboard (Wayland) on the host." >&2 ;;
+      esac
+    fi
+    return 0
+  fi
+
+  local root="${XDG_CACHE_HOME:-$HOME/.cache}/ccd/clipboard"
+  mkdir -p "$root" 2>/dev/null || return 0
+
+  # Leftovers from a run that was killed before its trap could fire. The directory is
+  # named after the ccd pid, so anything whose process is gone is dead weight — and going
+  # by the pid rather than by age means we never pull the bridge out from under a session
+  # that has simply been open for a long time.
+  local stale
+  for stale in "$root"/*; do
+    [ -d "$stale" ] || continue
+    case "${stale##*/}" in
+      ''|*[!0-9]*) continue ;;            # not a pid directory — leave it alone
+    esac
+    kill -0 "${stale##*/}" 2>/dev/null || rm -rf "$stale" 2>/dev/null || true
+  done
+
+  CLIP_DIR="$root/$$"
+  rm -rf "$CLIP_DIR"
+  mkdir -p "$CLIP_DIR" || { CLIP_DIR=""; return 0; }
+  chmod 700 "$CLIP_DIR" 2>/dev/null || true
+
+  clip_bridge_loop &
+  CLIP_PID=$!
+  trap clip_bridge_stop EXIT INT TERM
+
+  RUN_FLAGS+=(-v "$(to_host_path "$CLIP_DIR")":"$CLIP_MOUNT")
+  RUN_FLAGS+=(-e CCD_CLIP_BRIDGE="$CLIP_MOUNT")
+}
+
+clip_bridge_start
 
 # Determine what we mount. If we're in a git repo, mount the repo root (so the
 # .git directory comes along into the container and commit/push work) and set the working

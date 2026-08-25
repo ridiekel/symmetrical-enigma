@@ -174,6 +174,15 @@ ENV PATH="${JAVA_HOME}/bin:${MAVEN_HOME}/bin:${PATH}"
 # The entrypoint runs as root, maps 'claude' to the host uid/gid (if provided)
 # and then drops privileges with gosu.
 USER root
+
+# Clipboard tools for the clipboard bridge (see entrypoint.sh). Only the *fallback* path
+# needs these — the bridge itself talks to the host, so this is for the case where someone
+# passes a real DISPLAY into the container instead. Kept in its own late layer rather than
+# in the apt block at the top: touching that first RUN invalidates the whole cache, and a
+# rebuild of this image means downloading GraalVM and Chromium all over again.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    xclip wl-clipboard \
+    && rm -rf /var/lib/apt/lists/*
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

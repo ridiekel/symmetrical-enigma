@@ -42,6 +42,7 @@ Based on `ubuntu:26.04`, including:
 - **GraalVM 25** (full JDK + `native-image`) and **Maven** via SDKMAN
 - Tooling: `git`, `git-lfs`, `ripgrep`, `fd`, `fzf`, `jq`, `build-essential`, …
 - **Chromium** (headless) for screenshots, HTML/PDF rendering and e2e tests
+- `xclip` / `wl-clipboard`, used by the [clipboard bridge](#pasting-images-clipboard-bridge) that makes image paste work
 
 The container runs as the non-root user `claude`. On Linux it automatically takes over your
 host uid/gid (via `ccd`), so files in bind mounts get the right owner.
@@ -151,6 +152,7 @@ simply keep running on what you already have. It is skipped in a git checkout.
 ccd                 # interactive Claude Code session in the current directory
 ccd --version       # arguments are passed through to claude
 ccd -p "fix the failing test"
+ccd --no-clipboard  # skip the host clipboard bridge (see below)
 ```
 
 `ccd` automatically:
@@ -311,6 +313,38 @@ The volume itself keeps existing (now empty). To remove it entirely, you can als
 > doesn't exist on the host. testcontainers' `MountableFile`/`withCopyFileToContainer`
 > (copying) does work. In DinD this isn't an issue, since the daemon lives in the same container.
 
+### Pasting images (clipboard bridge)
+
+Ctrl+V with an image on the clipboard works in a `ccd` session, on every supported host.
+
+That needs a bridge, because the image never travels through the terminal: Claude Code
+reads the **system clipboard** itself, and inside the container it sees Linux and so shells
+out to `xclip`/`wl-paste`. A container has no clipboard of its own and no route to the
+host's, so without help the paste silently does nothing.
+
+`ccd` therefore starts a small poller on the host and bind-mounts a directory at
+`/run/ccd-clipboard`. In the container, an `xclip` shim writes its request into that
+directory; the poller answers it with whatever the host platform actually uses:
+
+| Host | Reads the clipboard with |
+| --- | --- |
+| macOS | `osascript` (`the clipboard as «class PNGf»`) |
+| Linux, X11 | `xclip` — install it on the **host** (`apt install xclip`) |
+| Linux, Wayland | `wl-paste` — install `wl-clipboard` on the **host** |
+| Windows (Git Bash) | `powershell.exe` + `System.Windows.Forms.Clipboard` |
+| WSL2 | `powershell.exe` as well — what you copy in a Windows app is on the *Windows* clipboard, which WSLg does not hand to `xclip` |
+
+It works the other way round too: copying a screenshot out of Claude Code puts the image on
+your host clipboard.
+
+If no clipboard tool is found, `ccd` says so once at startup and simply carries on — a
+headless or CI run has no clipboard to bridge. Turn the bridge off entirely with
+`ccd --no-clipboard` or `CCD_NO_CLIPBOARD=1`.
+
+Dragging an image **file** into the terminal is a separate matter: that pastes a *host*
+path, which only resolves in the container when the file sits inside the mounted repo.
+Copy the image to the clipboard instead, or drop it in your project first.
+
 ### Chromium / headless browser
 
 The image contains a Chromium build (via Playwright, so it works on `arm64` too). Handy for
@@ -376,6 +410,11 @@ yourself and point `CLAUDE_IMAGE` at it (see
 - **testcontainers: connection refused on the started container** — in DooD on Linux,
   `--network host` (automatic with `--docker`) provides localhost access; on macOS
   `TESTCONTAINERS_HOST_OVERRIDE` handles it. In DinD you connect via `localhost` anyway.
+- **Ctrl+V does nothing with an image on the clipboard** — the host needs a clipboard tool
+  the bridge can call. On Linux that is `xclip` (X11) or `wl-clipboard` (Wayland), *on the
+  host*, not in the container; `ccd` prints a note at startup when it finds neither. Over a
+  plain SSH session there is no clipboard to read at all. See
+  [Pasting images](#pasting-images-clipboard-bridge).
 - **Linux: permission problems on mounted directories** — `ccd` passes your host uid/gid
   (`HOST_UID`/`HOST_GID`) and the container remaps itself to them. If you run the image
   *without* `ccd`, pass those env vars yourself. With a differing uid, `~` is `chown`ed

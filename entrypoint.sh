@@ -92,6 +92,105 @@ if [ -S "$DOCKER_SOCK" ]; then
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# Clipboard bridge (image paste)
+# ---------------------------------------------------------------------------
+# Claude Code reads images off the clipboard by running 'xclip'. There is no clipboard in
+# here, so we install a shim that forwards the request over a bind-mounted directory to
+# the poller 'ccd' runs on the host (see the clip_* functions there). Installed
+# unconditionally: without a bridge the shim just hands over to the real xclip, which is
+# exactly what you want when someone passes a DISPLAY into the container instead.
+CLIP_BRIDGE="${CCD_CLIP_BRIDGE:-/run/ccd-clipboard}"
+if [ -d "$CLIP_BRIDGE" ]; then
+  chown "$(id -u "$USER_NAME"):$(id -g "$USER_NAME")" "$CLIP_BRIDGE" 2>/dev/null || true
+  chmod 700 "$CLIP_BRIDGE" 2>/dev/null || true
+fi
+
+cat > /usr/local/bin/xclip <<'CCD_XCLIP_SHIM'
+#!/bin/sh
+# ccd clipboard shim — see entrypoint.sh. Handles the image calls Claude Code makes:
+#   xclip -selection clipboard -t TARGETS   -o     -> "image/png" when the host has an image
+#   xclip -selection clipboard -t image/png -o     -> the bytes on stdout
+#   xclip -selection clipboard -t image/png -i FILE-> put FILE on the host clipboard
+# Everything else falls through to the real xclip.
+BRIDGE="${CCD_CLIP_BRIDGE:-/run/ccd-clipboard}"
+REAL=/usr/bin/xclip
+
+fallback() {
+  [ -x "$REAL" ] && exec "$REAL" "$@"
+  echo "xclip: no clipboard available in this container" >&2
+  exit 1
+}
+
+[ -d "$BRIDGE" ] || fallback "$@"
+
+# Scan the arguments without consuming them, so fallback() can still pass on the original
+# command line untouched.
+mode=out
+target=""
+file=""
+want=""
+for a in "$@"; do
+  if [ -n "$want" ]; then
+    [ "$want" = t ] && target="$a"
+    want=""
+    continue
+  fi
+  case "$a" in
+    -t|-target|--target)                   want=t ;;
+    -sel|-select|-selection|--selection)   want=s ;;
+    -d|-display|--display)                 want=s ;;
+    -o|-out|--out)                         mode=out ;;
+    -i|-in|--in)                           mode=in ;;
+    -*)                                    ;;
+    *)                                     file="$a" ;;
+  esac
+done
+
+case "$mode/$target" in
+  out/TARGETS|out/targets) op=targets ;;
+  out/image/*)             op=read ;;
+  in/image/*)              op=write ;;
+  *)                       fallback "$@" ;;
+esac
+
+id="$BRIDGE/$$-$(date +%s%N 2>/dev/null || date +%s)"
+cleanup() { rm -f "$id.op" "$id.req" "$id.out" "$id.rc" "$id.payload" 2>/dev/null; }
+trap 'cleanup; exit 1' INT TERM
+
+if [ "$op" = write ]; then
+  if [ -n "$file" ]; then
+    cp "$file" "$id.payload" 2>/dev/null || { cleanup; exit 1; }
+  else
+    cat > "$id.payload" || { cleanup; exit 1; }
+  fi
+fi
+
+# The .req marker goes last: the poller only starts reading once everything else is
+# written, so it can never pick up a half-finished request.
+printf '%s\n' "$op" > "$id.op" || { cleanup; exit 1; }
+: > "$id.req"
+
+# The host answers within a poll interval (100ms) plus however long its clipboard command
+# takes. The timeout is only there so a bridge that died can't hang the session.
+waited=0
+limit=$(( ${CCD_CLIP_TIMEOUT:-10} * 20 ))
+while [ ! -f "$id.rc" ]; do
+  waited=$(( waited + 1 ))
+  if [ "$waited" -gt "$limit" ]; then
+    cleanup
+    exit 1
+  fi
+  sleep 0.05
+done
+
+rc="$(cat "$id.rc" 2>/dev/null || echo 1)"
+[ "$rc" = 0 ] && [ -s "$id.out" ] && cat "$id.out"
+cleanup
+exit "$rc"
+CCD_XCLIP_SHIM
+chmod 0755 /usr/local/bin/xclip
+
 # Drop privileges to 'claude' and start Claude Code
 # (login shell so SDKMAN/Java/Maven are on PATH)
 exec gosu "$USER_NAME" bash -lc 'exec claude "$@"' -- "$@"
