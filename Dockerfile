@@ -127,12 +127,18 @@ RUN curl -fsSL "https://get.sdkman.io?rcupdate=false" | bash
 # GraalVM (full JDK + native-image) and Maven via SDKMAN
 ENV GRAAL_MAJOR=25
 
+# SDKMAN identifiers are parsed out of the last column of 'sdk list java'; a plain grep on
+# the version number no longer works since GraalVM switched its scheme (JDK 21 was
+# '21.0.12-graal', JDK 25 is '25.3.4+1.r25-graal'). The '-graal$' anchor keeps GraalVM CE
+# ('-graalce') out of the list.
 # We don't just take the newest version: it is sometimes listed but not (yet)
 # installable for this platform ("... is not available"), which made the build fail.
 # So we walk through all GraalVM candidates of this major version (newest first) and
 # keep going until one installs successfully.
 RUN bash -lc 'source "${SDKMAN_DIR}/bin/sdkman-init.sh" && \
-    candidates=$(sdk list java | grep -Eo "$GRAAL_MAJOR\.[0-9.]+-graal" | sort -Vru || true) && \
+    listing=$(sdk list java) && \
+    candidates=$(printf "%s\n" "$listing" | sed -E "s/.*\| *//; s/ +$//" \
+      | grep -E "^${GRAAL_MAJOR}[.+][^ ]*-graal$" | sort -Vru || true) && \
     echo "GraalVM candidates (newest first): $candidates" && \
     installed="" && \
     for v in $candidates; do \
@@ -145,7 +151,8 @@ RUN bash -lc 'source "${SDKMAN_DIR}/bin/sdkman-init.sh" && \
       echo ">> $v not available, trying next candidate..."; \
     done && \
     if [ -z "$installed" ]; then \
-      echo "!! No GraalVM $GRAAL_MAJOR version could be installed" >&2; \
+      echo "!! No GraalVM $GRAAL_MAJOR version could be installed; graal entries seen:" >&2; \
+      printf "%s\n" "$listing" | grep -i graal >&2 || true; \
       exit 1; \
     fi && \
     sdk default java "$installed" && \
