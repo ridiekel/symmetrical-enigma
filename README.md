@@ -153,6 +153,7 @@ ccd                 # interactive Claude Code session in the current directory
 ccd --version       # arguments are passed through to claude
 ccd -p "fix the failing test"
 ccd --no-clipboard  # skip the host clipboard bridge (see below)
+ccd --no-m2         # skip mounting the host Maven repository (see below)
 ```
 
 `ccd` automatically:
@@ -161,6 +162,7 @@ ccd --no-clipboard  # skip the host clipboard bridge (see below)
 2. Builds the image locally from the `Dockerfile` (only when needed — see below).
 3. Mounts the current directory at `/workdir` in the container.
 4. Keeps config/login in `~/.config/claude-docker` (mounted at `/home/claude/.claude`).
+5. Mounts your host `~/.m2` at `/home/claude/.m2` (Maven cache + `settings.xml`).
 
 ### Building the image
 
@@ -208,6 +210,23 @@ therefore lost ("configuration file not found"). That's why the image sets
 `CLAUDE_CONFIG_DIR=/home/claude/.claude`, so `.claude.json` plus `projects/`,
 `sessions/` and `backups/` all end up *in* the mounted directory and are kept between
 sessions.
+
+### Maven repository (`~/.m2`)
+
+`ccd` mounts your host `~/.m2` at `/home/claude/.m2`. Without it every `--rm` run starts
+with an empty local repository — so Maven re-downloads all dependencies — and a corporate
+`settings.xml` (mirror, repository credentials) would be missing as well. With the mount
+the container uses the same artifact cache and the same settings as your host, and
+anything it downloads stays behind on the host.
+
+The directory is created if it doesn't exist yet (by `ccd`, so it belongs to you and
+not to root). Point it elsewhere with `CCD_M2_DIR`, or turn it off:
+
+```bash
+ccd --no-m2
+CCD_NO_M2=1 ccd                      # same effect
+CCD_M2_DIR=~/work/.m2 ccd            # a different host directory
+```
 
 ### SSH / git over SSH
 

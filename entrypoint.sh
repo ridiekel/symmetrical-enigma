@@ -15,8 +15,15 @@ fi
 
 if [ -n "$TARGET_UID" ] && [ "$TARGET_UID" != "$(id -u "$USER_NAME")" ]; then
   usermod -o -u "$TARGET_UID" "$USER_NAME"
-  # Home (incl. ~/.sdkman, ~/.m2, …) back to the new owner
-  chown -R "$TARGET_UID:${TARGET_GID:-$TARGET_UID}" "$USER_HOME"
+  # Home (incl. ~/.sdkman, …) back to the new owner. A bind-mounted ~/.m2 is skipped:
+  # those files already belong to the host user, and a Maven repository is big enough
+  # that a recursive chown on every start would be noticeable.
+  if grep -q " $USER_HOME/.m2 " /proc/mounts 2>/dev/null; then
+    find "$USER_HOME" -path "$USER_HOME/.m2" -prune -o \
+      -exec chown -h "$TARGET_UID:${TARGET_GID:-$TARGET_UID}" {} +
+  else
+    chown -R "$TARGET_UID:${TARGET_GID:-$TARGET_UID}" "$USER_HOME"
+  fi
 fi
 
 # Persistent SSH directory (mounted at ~/.ssh by 'ccd'). Set the right owner/permissions

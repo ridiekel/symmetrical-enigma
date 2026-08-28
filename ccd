@@ -61,11 +61,13 @@ to_unix_path() {
 #                             clean up the old images/build cache (volumes are kept)
 #   --no-update               skip the auto-update check against GitHub for this run
 #   --no-clipboard            don't set up the host clipboard bridge (image paste)
+#   --no-m2                   don't mount the host Maven repository (~/.m2)
 DOCKER_MODE=""
 PRUNE=0
 REBUILD=0
 NO_UPDATE=0
 NO_CLIPBOARD=0
+NO_M2=0
 CLAUDE_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -76,6 +78,7 @@ while [ $# -gt 0 ]; do
     --rebuild)   REBUILD=1 ;;
     --no-update) NO_UPDATE=1 ;;
     --no-clipboard) NO_CLIPBOARD=1 ;;
+    --no-m2)     NO_M2=1 ;;
     --)          shift; CLAUDE_ARGS+=("$@"); break ;;
     *)           CLAUDE_ARGS+=("$1") ;;
   esac
@@ -708,6 +711,26 @@ clip_bridge_start() {
 }
 
 clip_bridge_start
+
+# ---------------------------------------------------------------------------
+# Maven repository (~/.m2)
+# ---------------------------------------------------------------------------
+# A --rm container starts with an empty local Maven repository, so every run re-downloads
+# the world (and a corporate settings.xml with the mirror/credentials is missing too).
+# Mounting the host ~/.m2 shares the artifact cache *and* the settings with the container.
+# The host path is overridable with CCD_M2_DIR; off with --no-m2 / CCD_NO_M2=1.
+M2_DIR="${CCD_M2_DIR:-$HOME/.m2}"
+if [ "$NO_M2" != "1" ] && [ -z "${CCD_NO_M2:-}" ]; then
+  # Create it ourselves when it doesn't exist yet: Docker would otherwise create the bind
+  # source as root, leaving a directory the host user can't write to.
+  mkdir -p "$M2_DIR" 2>/dev/null || true
+  if [ -d "$M2_DIR" ]; then
+    RUN_FLAGS+=(-v "$(to_host_path "$M2_DIR")":/home/claude/.m2)
+  else
+    echo "Warning: '$M2_DIR' does not exist and could not be created — Maven runs" >&2
+    echo "with an empty repository in the container." >&2
+  fi
+fi
 
 # Determine what we mount. If we're in a git repo, mount the repo root (so the
 # .git directory comes along into the container and commit/push work) and set the working
