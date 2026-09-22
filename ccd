@@ -59,12 +59,15 @@ to_unix_path() {
 #   --prune                   clean up the DinD image store (implies --dind) and exit afterwards
 #   --rebuild                 force a clean rebuild of the local image and afterwards
 #                             clean up the old images/build cache (volumes are kept)
+#   --update                  alias for --rebuild: the way to get a newer Claude Code
+#                             ('claude --update' can't work in this image, see below)
 #   --no-update               skip the auto-update check against GitHub for this run
 #   --no-clipboard            don't set up the host clipboard bridge (image paste)
 #   --no-m2                   don't mount the host Maven repository (~/.m2)
 DOCKER_MODE=""
 PRUNE=0
 REBUILD=0
+UPDATE_ALIAS=0
 NO_UPDATE=0
 NO_CLIPBOARD=0
 NO_M2=0
@@ -76,6 +79,7 @@ while [ $# -gt 0 ]; do
     --dind)      DOCKER_MODE="dind" ;;
     --prune)     PRUNE=1 ;;
     --rebuild)   REBUILD=1 ;;
+    --update)    REBUILD=1; UPDATE_ALIAS=1 ;;
     --no-update) NO_UPDATE=1 ;;
     --no-clipboard) NO_CLIPBOARD=1 ;;
     --no-m2)     NO_M2=1 ;;
@@ -215,6 +219,21 @@ if [ -n "${CLAUDE_IMAGE:-}" ]; then
 else
   IMAGE="claude-code:local"
   BUILD_LOCAL=1
+fi
+
+# '--update' is an alias for '--rebuild'. Typing 'ccd --update' is the obvious reflex, but
+# that flag used to fall through to 'claude --update', which cannot succeed here: Claude Code
+# lives in the root-owned npm prefix while the session runs as 'claude' ("Insufficient
+# permissions to install update"), and a --rm container would throw the update away anyway.
+# Rebuilding the image is the real update path, so that is what we do.
+if [ "$UPDATE_ALIAS" = "1" ]; then
+  if [ "$BUILD_LOCAL" = "1" ]; then
+    echo "--update: rebuilding the image so the latest Claude Code gets installed..."
+  else
+    echo "--update: CLAUDE_IMAGE is set ($IMAGE), so there is no local image to rebuild." >&2
+    echo "Refresh that image yourself, for example: docker pull $IMAGE" >&2
+    exit 1
+  fi
 fi
 
 CONFIG_DIR="${HOME}/.config/claude-docker"

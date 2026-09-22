@@ -146,6 +146,29 @@ simply keep running on what you already have. It is skipped in a git checkout.
 | `CCD_NO_UPDATE=1` | same, via the environment |
 | `CCD_UPDATE_INTERVAL=86400` | check at most once per N seconds (default `0` = every start) |
 
+### Updating Claude Code
+
+The auto-update above keeps **`ccd` itself** current; the Claude Code version comes from the
+image. To pull in a newer one:
+
+```bash
+ccd --update        # alias for --rebuild: clean rebuild, then start the session as usual
+```
+
+`claude --update` inside the container does **not** work — Claude Code is installed globally
+as root in `/usr/lib/node_modules` while the session runs as `claude`, so it can't write in the
+npm prefix (`Insufficient permissions to install update` when you run it by hand,
+`Auto-update failed: no write permission to npm prefix` from the background updater). That is
+also why the image sets `DISABLE_AUTOUPDATER=1`: in a `--rm` container an update would be
+discarded at exit anyway. `ccd` therefore catches `--update` and rebuilds the image instead of
+passing the flag through — use `ccd -- --update` if you really want the raw flag.
+
+You rarely need it by hand: an image older than 10 days is rebuilt automatically (see
+[Building the image](#building-the-image)).
+
+With `CLAUDE_IMAGE` set there is no local image to rebuild, so `ccd --update` refuses and
+tells you to refresh that image yourself (`docker pull …`).
+
 ## Usage
 
 ```bash
@@ -260,6 +283,7 @@ image has nothing to talk to.
 | `--docker=dind` or `--dind` | **DinD** (Docker-in-Docker) | Starts its own daemon *in* the container, fully separate from the host. |
 | `--prune` | **DinD** + cleanup | Cleans up the DinD image store and exits (implies `--dind`). |
 | `--rebuild` | build | Forces a clean rebuild (`--no-cache`) of the local image and cleans up old images/build cache (volumes are kept). |
+| `--update` | build | Alias for `--rebuild`: the way to get a newer Claude Code. Errors out when `CLAUDE_IMAGE` pins an image (see [Updating Claude Code](#updating-claude-code)). |
 | `--no-update` | update | Skips the auto-update check against GitHub for this run. |
 
 The flag goes before the arguments for `claude`; everything else `ccd` passes through unchanged:
