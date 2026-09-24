@@ -411,6 +411,15 @@ await chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
 Running without `--headless` is possible too, via the bundled `xvfb-run`. The `dbus` error
 messages on stderr are harmless: there is no desktop session running in the container.
 
+### Timezone
+
+The image defaults to UTC; `ccd` passes your host's zone into the container as `TZ`, so
+`date`, `git log`, logs and the JVM show local time. The zone comes from, in order: `TZ` on
+the host, the `/etc/localtime` symlink (Linux, WSL, macOS), `/etc/timezone`, and on Git Bash
+`pwsh` (PowerShell 7, which can map the Windows zone to an IANA name). Without any of those,
+the current UTC offset is used as a fixed zone — correct now, but it won't follow a DST switch.
+Force a zone with e.g. `TZ=Europe/Brussels ccd`.
+
 ### Using an existing image (instead of building)
 
 Want to run a ready-made image instead of building locally? Set `CLAUDE_IMAGE`.

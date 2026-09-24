@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bash-completion \
     gosu \
     iptables uidmap \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # Ubuntu marks its Python as "externally managed" (PEP 668), which makes a plain

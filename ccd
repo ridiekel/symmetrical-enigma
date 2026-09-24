@@ -424,6 +424,56 @@ for var in TERM COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION; do
   [ -n "${!var:-}" ] && RUN_FLAGS+=(-e "$var")
 done
 
+# Timezone: the image defaults to UTC, so timestamps (git log, logs, 'date', Java) would be
+# off from the host. Pass the host zone as TZ; tzdata in the image resolves the IANA name.
+#   1. TZ set on the host (a zone name, not a ':/path' form) -> use that
+#   2. /etc/localtime symlink (Linux, WSL, macOS) -> .../zoneinfo/Europe/Brussels
+#   3. /etc/timezone (older Debian/Ubuntu)
+#   4. Git Bash: Windows zone -> IANA via pwsh (.NET 6+ can convert; Windows PowerShell 5.1 can't)
+#   5. fallback: the current UTC offset as a fixed zone (loses DST switches)
+host_timezone() {
+  local tz="" link
+  case "${TZ:-}" in
+    ""|:*|/*) ;;
+    *) tz="$TZ" ;;
+  esac
+  if [ -z "$tz" ] && link="$(readlink /etc/localtime 2>/dev/null)" && [ "${link#*zoneinfo/}" != "$link" ]; then
+    tz="${link#*zoneinfo/}"
+  fi
+  if [ -z "$tz" ] && [ -r /etc/timezone ]; then
+    tz="$(head -n1 /etc/timezone)"
+  fi
+  if [ -z "$tz" ] && [ "$IS_WINDOWS" = "1" ] && command -v pwsh >/dev/null 2>&1; then
+    tz="$(pwsh -NoProfile -NonInteractive -Command \
+      '$i=$null; if ([TimeZoneInfo]::TryConvertWindowsIdToIanaId([TimeZoneInfo]::Local.Id, [ref]$i)) { $i }' \
+      2>/dev/null | tr -d '\r')" || tz=""
+  fi
+  # Only accept something that looks like a zone name; anything else goes to the fallback.
+  case "$tz" in
+    *[!A-Za-z0-9_+/-]*|"") tz="" ;;
+  esac
+  if [ -z "$tz" ]; then
+    # date +%z -> +0200. Whole hours map to Etc/GMT-2 (note the inverted sign, POSIX style);
+    # others become a POSIX string like <+0530>-05:30.
+    local z sign hh mm inv
+    z="$(date +%z 2>/dev/null)" || z=""
+    case "$z" in
+      [+-][0-9][0-9][0-9][0-9]) ;;
+      *) return 0 ;;
+    esac
+    sign="${z:0:1}"; hh="${z:1:2}"; mm="${z:3:2}"
+    if [ "$sign" = "+" ]; then inv="-"; else inv="+"; fi
+    if [ "$mm" = "00" ]; then
+      [ "$hh" = "00" ] && tz="Etc/UTC" || tz="Etc/GMT${inv}$((10#$hh))"
+    else
+      tz="<${z}>${inv}${hh}:${mm}"
+    fi
+  fi
+  printf '%s\n' "$tz"
+}
+HOST_TZ="$(host_timezone)"
+[ -n "$HOST_TZ" ] && RUN_FLAGS+=(-e TZ="$HOST_TZ")
+
 # Copy-paste fix: Claude Code enables full mouse tracking by default
 # (ESC[?1000h + ESC[?1006h). As long as that mouse mode is active, the macOS terminal
 # hands your drag actions to the TUI instead of making its own selection — which leaves
