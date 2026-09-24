@@ -40,7 +40,7 @@ Based on `ubuntu:26.04`, including:
 - **Claude Code** (`@anthropic-ai/claude-code`) + `yarn` / `pnpm`
 - **Node.js LTS**, **Python 3** (`pip`, `venv`, `pipx`)
 - **GraalVM 25** (full JDK + `native-image`) and **Maven** via SDKMAN
-- Tooling: `git`, `git-lfs`, `ripgrep`, `fd`, `fzf`, `jq`, `build-essential`, …
+- Tooling: `git`, `git-lfs`, `ripgrep`, `fd`, `fzf`, `jq`, `gitleaks`, `build-essential`, …
 - **Chromium** (headless) for screenshots, HTML/PDF rendering and e2e tests
 - `xclip` / `wl-clipboard`, used by the [clipboard bridge](#pasting-images-clipboard-bridge) that makes image paste work
 

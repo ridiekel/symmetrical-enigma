@@ -190,6 +190,37 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xclip wl-clipboard \
     && rm -rf /var/lib/apt/lists/*
+
+# gitleaks, to scan a repo for committed secrets ('gitleaks git', 'gitleaks dir').
+# Ubuntu does package it, but lags far behind upstream and its rule set is what matters
+# here, so we pull the release binary and check it against the published checksums.
+# Late, separate layer for the same cache reason as the clipboard tools above.
+# 'latest' is resolved through GitHub's /releases/latest redirect (not the API, which is
+# rate-limited). Like Claude Code itself, it is only re-resolved when this layer is rebuilt,
+# i.e. on 'ccd --rebuild' or the periodic max-age rebuild. Pin with
+# '--build-arg GITLEAKS_VERSION=8.30.1'.
+ARG GITLEAKS_VERSION=latest
+RUN set -eux; \
+    version="${GITLEAKS_VERSION#v}"; \
+    if [ "$version" = latest ]; then \
+      tag_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/gitleaks/gitleaks/releases/latest)"; \
+      version="${tag_url##*/v}"; \
+      echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; \
+    fi; \
+    case "$(uname -m)" in \
+      x86_64) arch=x64 ;; \
+      aarch64) arch=arm64 ;; \
+      *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    base="https://github.com/gitleaks/gitleaks/releases/download/v${version}"; \
+    tarball="gitleaks_${version}_linux_${arch}.tar.gz"; \
+    cd /tmp; \
+    curl -fsSLO "${base}/${tarball}"; \
+    curl -fsSL "${base}/gitleaks_${version}_checksums.txt" | grep " ${tarball}\$" | sha256sum -c -; \
+    tar -xzf "$tarball" gitleaks; \
+    install -m 0755 gitleaks /usr/local/bin/gitleaks; \
+    rm -f "$tarball" gitleaks; \
+    gitleaks version
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
