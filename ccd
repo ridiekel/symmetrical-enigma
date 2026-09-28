@@ -236,7 +236,14 @@ if [ "$UPDATE_ALIAS" = "1" ]; then
   fi
 fi
 
-CONFIG_DIR="${HOME}/.config/claude-docker"
+# Host-side state for ccd itself (the image build marker). Always the default directory,
+# whichever profile is in use, so switching profiles doesn't trigger a rebuild.
+STATE_DIR="${HOME}/.config/claude-docker"
+mkdir -p "$STATE_DIR"
+
+# Claude config/login, mounted at /home/claude/.claude. Overridable with CCD_CONFIG_DIR to
+# keep separate profiles, e.g. a personal and a work account, each with its own login.
+CONFIG_DIR="${CCD_CONFIG_DIR:-$STATE_DIR}"
 mkdir -p "$CONFIG_DIR"
 
 # Persistent, container-owned SSH directory (separate from the host ~/.ssh). It keeps an
@@ -337,7 +344,7 @@ if [ "$BUILD_LOCAL" = "1" ]; then
   build_hash() {
     cat "$SCRIPT_DIR/Dockerfile" "$SCRIPT_DIR/entrypoint.sh" | sha_cmd | awk '{print $1}'
   }
-  HASH_FILE="$CONFIG_DIR/.image-hash"
+  HASH_FILE="$STATE_DIR/.image-hash"
 
   # Max age of the local image in days. If the image is older, we periodically force
   # a clean rebuild so the latest Claude Code + base-image/apt updates get pulled again.

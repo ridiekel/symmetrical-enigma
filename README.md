@@ -234,6 +234,26 @@ therefore lost ("configuration file not found"). That's why the image sets
 `sessions/` and `backups/` all end up *in* the mounted directory and are kept between
 sessions.
 
+### Multiple accounts (profiles)
+
+Point `CCD_CONFIG_DIR` at another host directory to get a separate profile, each with its
+own login. Handy for keeping a personal and a work account apart:
+
+```bash
+alias ccd-work='CCD_CONFIG_DIR=~/.config/claude-docker-work ccd'
+```
+
+Plain `ccd` keeps using `~/.config/claude-docker`. Log in once per profile with `/login`;
+`/status` shows which account a session is using.
+
+A profile holds *everything* that normally lives in the config directory: settings,
+`CLAUDE.md`, memory, session history and its own SSH directory (`<profile>/ssh`), so a
+work profile can use a different SSH key than your personal one. A new profile starts
+empty; copy over `settings.json` or `CLAUDE.md` if you want the same setup. Don't
+symlink them to a path outside the profile: only the profile directory is mounted, so
+such a link is dangling inside the container. The image build marker (`.image-hash`)
+always stays in `~/.config/claude-docker`, so switching profiles doesn't trigger a rebuild.
+
 ### Maven repository (`~/.m2`)
 
 `ccd` mounts your host `~/.m2` at `/home/claude/.m2`. Without it every `--rm` run starts
