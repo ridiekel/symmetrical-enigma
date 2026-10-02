@@ -64,6 +64,8 @@ to_unix_path() {
 #   --no-update               skip the auto-update check against GitHub for this run
 #   --no-clipboard            don't set up the host clipboard bridge (image paste)
 #   --no-m2                   don't mount the host Maven repository (~/.m2)
+#   --mount SRC[:DST][:ro]    mount an extra host directory (repeatable); DST defaults
+#                             to /mnt/<basename of SRC>. Also via CCD_MOUNTS (comma-separated).
 DOCKER_MODE=""
 PRUNE=0
 REBUILD=0
@@ -71,6 +73,7 @@ UPDATE_ALIAS=0
 NO_UPDATE=0
 NO_CLIPBOARD=0
 NO_M2=0
+EXTRA_MOUNTS=()
 CLAUDE_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -83,6 +86,12 @@ while [ $# -gt 0 ]; do
     --no-update) NO_UPDATE=1 ;;
     --no-clipboard) NO_CLIPBOARD=1 ;;
     --no-m2)     NO_M2=1 ;;
+    --mount)     if [ $# -lt 2 ]; then
+                   echo "--mount needs an argument: SRC[:DST][:ro]" >&2
+                   exit 1
+                 fi
+                 shift; EXTRA_MOUNTS+=("$1") ;;
+    --mount=*)   EXTRA_MOUNTS+=("${1#--mount=}") ;;
     --)          shift; CLAUDE_ARGS+=("$@"); break ;;
     *)           CLAUDE_ARGS+=("$1") ;;
   esac
@@ -807,6 +816,52 @@ if [ "$NO_M2" != "1" ] && [ -z "${CCD_NO_M2:-}" ]; then
     echo "with an empty repository in the container." >&2
   fi
 fi
+
+# ---------------------------------------------------------------------------
+# Extra mounts (--mount / CCD_MOUNTS)
+# ---------------------------------------------------------------------------
+# Extra host directories besides the repo itself — a second repo, a data directory, ...
+# Spec: SRC[:DST][:ro]. DST defaults to /mnt/<basename of SRC>; a trailing ':ro' makes
+# the mount read-only in the container. On Git Bash write SRC in the /c/Users/... form,
+# so the ':' of 'C:' can't be mistaken for the SRC/DST separator.
+add_extra_mount() {
+  local spec="$1" src dst="" ro=""
+  case "$spec" in
+    *:ro) ro=":ro"; spec="${spec%:ro}" ;;
+  esac
+  src="${spec%%:*}"
+  [ "$src" != "$spec" ] && dst="${spec#*:}"
+  if [ -z "$src" ]; then
+    echo "--mount: empty host path in '$1'." >&2
+    exit 1
+  fi
+  # Resolve SRC (relative to where ccd was started) and require an existing directory:
+  # if we let docker create the bind source, a root-owned directory appears on the host.
+  if ! src="$(CDPATH= cd -P -- "$src" 2>/dev/null && pwd)"; then
+    echo "--mount: host directory '$1' does not exist (or is not a directory)." >&2
+    exit 1
+  fi
+  [ -z "$dst" ] && dst="/mnt/$(basename "$src")"
+  case "$dst" in
+    /*) ;;
+    *)  echo "--mount: container path '$dst' must be absolute." >&2
+        exit 1 ;;
+  esac
+  RUN_FLAGS+=(-v "$(to_host_path "$src")":"$dst$ro")
+}
+
+# CCD_MOUNTS first (the environment is the "default"), then the --mount flags, so a flag
+# can override an env-provided mount on the same container path (last -v wins in docker).
+if [ -n "${CCD_MOUNTS:-}" ]; then
+  IFS=',' read -r -a CCD_MOUNT_SPECS <<< "$CCD_MOUNTS"
+  for spec in "${CCD_MOUNT_SPECS[@]+"${CCD_MOUNT_SPECS[@]}"}"; do
+    # Skip empty entries (a trailing comma); '&&' would trip 'set -e' here.
+    if [ -n "$spec" ]; then add_extra_mount "$spec"; fi
+  done
+fi
+for spec in "${EXTRA_MOUNTS[@]+"${EXTRA_MOUNTS[@]}"}"; do
+  add_extra_mount "$spec"
+done
 
 # Determine what we mount. If we're in a git repo, mount the repo root (so the
 # .git directory comes along into the container and commit/push work) and set the working

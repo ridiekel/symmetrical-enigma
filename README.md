@@ -177,6 +177,7 @@ ccd --version       # arguments are passed through to claude
 ccd -p "fix the failing test"
 ccd --no-clipboard  # skip the host clipboard bridge (see below)
 ccd --no-m2         # skip mounting the host Maven repository (see below)
+ccd --mount ~/data  # mount an extra host directory (see below)
 ```
 
 `ccd` automatically:
@@ -271,6 +272,39 @@ CCD_NO_M2=1 ccd                      # same effect
 CCD_M2_DIR=~/work/.m2 ccd            # a different host directory
 ```
 
+### Extra mounts (`--mount`)
+
+Besides the repo (at `/workdir`) you can mount additional host directories — a second
+repository, a shared data directory, a folder with reference docs:
+
+```bash
+ccd --mount ~/other-repo                   # at /mnt/other-repo
+ccd --mount ~/datasets:/data               # choose the container path yourself
+ccd --mount ~/secrets-config:/cfg:ro       # read-only in the container
+ccd --mount ~/a --mount ~/b               # repeatable
+CCD_MOUNTS="$HOME/a,$HOME/b:/data:ro" ccd  # same, via the environment (comma-separated)
+```
+
+The spec is `SRC[:DST][:ro]`:
+
+- **`SRC`** — the host directory. A relative path resolves against where you ran `ccd`.
+  It must already exist: `ccd` refuses otherwise, because letting Docker create the bind
+  source would leave a root-owned directory on your host.
+- **`DST`** (optional) — absolute path in the container; defaults to `/mnt/<basename of SRC>`.
+- **`:ro`** (optional) — mounts the directory read-only, so the session can read it but
+  never change it.
+
+`CCD_MOUNTS` takes the same specs, comma-separated (so paths with a comma need the flag).
+It is applied *before* the `--mount` flags; when both target the same container path, the
+flag wins. Handy in an alias or profile:
+
+```bash
+alias ccd-proj='CCD_MOUNTS=$HOME/shared-libs:/libs:ro ccd'
+```
+
+On Git Bash, write `SRC` in the `/c/Users/...` form — in `C:/Users/...` the `:` after the
+drive letter would be read as the `SRC`/`DST` separator.
+
 ### SSH / git over SSH
 
 `ccd` mounts a persistent, container-owned SSH directory
@@ -301,6 +335,7 @@ image has nothing to talk to.
 | ---- | ---- | ------------ |
 | `--docker` or `--docker=host` | **DooD** (Docker-outside-of-Docker) | Mounts the host Docker socket; testcontainers run as *siblings* on the host daemon. |
 | `--docker=dind` or `--dind` | **DinD** (Docker-in-Docker) | Starts its own daemon *in* the container, fully separate from the host. |
+| `--mount SRC[:DST][:ro]` | mounts | Mounts an extra host directory in the container (repeatable) — see [Extra mounts](#extra-mounts---mount). |
 | `--prune` | **DinD** + cleanup | Cleans up the DinD image store and exits (implies `--dind`). |
 | `--rebuild` | build | Forces a clean rebuild (`--no-cache`) of the local image and cleans up old images/build cache (volumes are kept). |
 | `--update` | build | Alias for `--rebuild`: the way to get a newer Claude Code. Errors out when `CLAUDE_IMAGE` pins an image (see [Updating Claude Code](#updating-claude-code)). |
