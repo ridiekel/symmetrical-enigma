@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential pkg-config \
     python3-yaml python3-requests python3-jinja2 python3-dateutil \
     python3-toml python3-bs4 python3-lxml python3-tabulate \
-    python3-rich python3-pytest \
+    python3-rich python3-pytest python3-cryptography \
     python3-numpy python3-pandas python3-matplotlib \
     sudo openssh-client \
     bash-completion \
