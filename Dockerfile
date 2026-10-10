@@ -107,11 +107,27 @@ RUN set -eux; \
     ln -s /usr/local/bin/chromium /usr/local/bin/google-chrome; \
     chromium --headless --dump-dom about:blank > /dev/null
 
+# chromedriver for Selenium (Playwright doesn't need it: it talks CDP to the browser
+# directly). The driver has to match the browser version exactly, so we take it from
+# Chrome for Testing for the version Playwright installed above; unlike the google-chrome
+# .deb, Chrome for Testing does publish a linux-arm64 build. chromedriver starts the
+# 'chromium' wrapper, so --no-sandbox/--disable-dev-shm-usage apply there as well.
+RUN set -eux; \
+    version="$(chromium --version | grep -oE '[0-9]+(\.[0-9]+){3}')"; \
+    case "$(uname -m)" in x86_64) plat=linux64 ;; aarch64) plat=linux-arm64 ;; esac; \
+    curl -fsSL "https://storage.googleapis.com/chrome-for-testing-public/${version}/${plat}/chromedriver-${plat}.zip" -o /tmp/chromedriver.zip; \
+    unzip -q /tmp/chromedriver.zip -d /tmp; \
+    install -m 0755 "/tmp/chromedriver-${plat}/chromedriver" /usr/local/bin/chromedriver; \
+    rm -rf /tmp/chromedriver.zip "/tmp/chromedriver-${plat}"; \
+    chromedriver --version
+
 # This way Puppeteer/Playwright projects no longer have to download their own browser.
 ENV CHROME_PATH=/usr/local/bin/chromium \
     CHROME_BIN=/usr/local/bin/chromium \
     PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/chromium \
-    PUPPETEER_SKIP_DOWNLOAD=1
+    PUPPETEER_SKIP_DOWNLOAD=1 \
+    CHROMEDRIVER_PATH=/usr/local/bin/chromedriver \
+    SE_CHROMEDRIVER=/usr/local/bin/chromedriver
 
 USER claude
 ENV HOME=/home/claude
