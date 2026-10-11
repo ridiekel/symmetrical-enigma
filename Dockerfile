@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gosu \
     iptables uidmap \
     tzdata \
+    bind9-dnsutils \
     && rm -rf /var/lib/apt/lists/*
 
 # Ubuntu marks its Python as "externally managed" (PEP 668), which makes a plain
