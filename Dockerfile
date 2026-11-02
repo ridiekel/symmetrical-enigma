@@ -205,8 +205,11 @@ USER root
 # passes a real DISPLAY into the container instead. Kept in its own late layer rather than
 # in the apt block at the top: touching that first RUN invalidates the whole cache, and a
 # rebuild of this image means downloading GraalVM and Chromium all over again.
+# libxtst6 (X Test extension) rides along in the same layer: Java AWT (java.awt.Robot,
+# non-headless Swing/AWT) refuses to load libawt_xawt.so without it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xclip wl-clipboard \
+    libxtst6 \
     && rm -rf /var/lib/apt/lists/*
 
 # gitleaks, to scan a repo for committed secrets ('gitleaks git', 'gitleaks dir').
