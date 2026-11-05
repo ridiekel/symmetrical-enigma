@@ -603,12 +603,21 @@ esac
 # sockets such as X11's, and any port Claude opens lands on the host's real interfaces.
 # "The host" is the Docker daemon's network namespace: with a dind sidecar that is the
 # dind container, not the machine you run ccd on.
-if [ "$HOST_NET" = "1" ]; then
-  has_host_net=0
-  for ((i = 0; i < ${#RUN_FLAGS[@]} - 1; i++)); do
-    [ "${RUN_FLAGS[i]}" = "--network" ] && [ "${RUN_FLAGS[i+1]}" = "host" ] && has_host_net=1
-  done
-  [ "$has_host_net" = "1" ] || RUN_FLAGS+=(--network host)
+has_host_net=0
+for ((i = 0; i < ${#RUN_FLAGS[@]} - 1; i++)); do
+  [ "${RUN_FLAGS[i]}" = "--network" ] && [ "${RUN_FLAGS[i+1]}" = "host" ] && has_host_net=1
+done
+if [ "$HOST_NET" = "1" ] && [ "$has_host_net" = "0" ]; then
+  RUN_FLAGS+=(--network host)
+  has_host_net=1
+fi
+
+# Without host networking: make 'host.docker.internal' point to the host, as Docker Desktop
+# already does on macOS/Windows. 'host-gateway' is the daemon's bridge gateway (docker0,
+# usually 172.17.0.1), so a host service is only reachable this way if it listens on that
+# address or on 0.0.0.0 — not if it's bound to 127.0.0.1 only (that's what --host-net is for).
+if [ "$OS" = "Linux" ] && [ "$has_host_net" = "0" ]; then
+  RUN_FLAGS+=(--add-host=host.docker.internal:host-gateway)
 fi
 
 # ---------------------------------------------------------------------------

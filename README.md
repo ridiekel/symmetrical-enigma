@@ -440,9 +440,12 @@ want it without Docker access.
 > And any port Claude opens is bound to the host's real interfaces, so a dev server on
 > `0.0.0.0` is visible on your LAN.
 
-A narrower alternative, without the flag: let the host service also listen on the Docker
-bridge (`172.17.0.1`) and reach it from the container via that address. On Docker
-Desktop, `host.docker.internal` already points to the host.
+A narrower alternative, without the flag: `host.docker.internal` points to the host — on
+Docker Desktop out of the box, on Linux because `ccd` adds
+`--add-host=host.docker.internal:host-gateway` whenever host networking is off. On Linux
+that address is the Docker bridge gateway (usually `172.17.0.1`), so the host service must
+listen there or on `0.0.0.0`; one bound to `127.0.0.1` only is not reachable this way. In
+exchange you choose per service what the container can see.
 
 "The host" is the Docker daemon's network namespace. With a dind sidecar
 (`DOCKER_HOST=tcp://dind:2376`) that's the dind container, not the machine you run `ccd`
