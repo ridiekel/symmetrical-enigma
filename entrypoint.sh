@@ -4,6 +4,29 @@ set -euo pipefail
 USER_NAME="claude"
 USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
 
+# Mount check (see 'ccd'): the host config dir must actually arrive at ~/.claude. If the
+# token is missing, the daemon resolved our bind-mount paths on a different filesystem and
+# handed us empty directories — stop before generating keys or logging in into nowhere.
+if [ -n "${CCD_MOUNT_TOKEN:-}" ]; then
+  seen="$(cat "$USER_HOME/.claude/.ccd-mount-check" 2>/dev/null || true)"
+  if [ "$seen" != "$CCD_MOUNT_TOKEN" ]; then
+    cat >&2 <<EOF
+ccd: the config directory did not arrive in the container.
+  host path : ${CCD_HOST_CONFIG_DIR:-?}
+  expected  : $USER_HOME/.claude/.ccd-mount-check with this run's token
+
+Bind mounts are resolved by the Docker daemon on *its own* filesystem. This daemon
+(${CCD_DOCKER_HOST_HINT:-the local socket}) does not see that path, so it
+created empty directories instead — login, SSH key and /workdir would all be wrong.
+
+Fix: make that path available to the daemon at the *same* location. For a dind sidecar
+in docker compose: mount the volume that holds it into the dind service as well, at the
+same path as in your own container (e.g. '- <home-volume>:/home/<you>').
+EOF
+    exit 1
+  fi
+fi
+
 # Optional: map the container user to the host uid/gid so that bind mounts (Linux)
 # get the right owner. 'ccd' only sets these on Linux; empty => keep the image uid.
 TARGET_UID="${HOST_UID:-}"

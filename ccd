@@ -878,6 +878,16 @@ if GIT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
   WORKDIR_IN="/workdir${REL}"
 fi
 
+# Mount check: bind mounts are resolved by the Docker *daemon*, on its own filesystem. When
+# the daemon runs elsewhere (a dind sidecar via DOCKER_HOST=tcp://..., a remote host) and
+# doesn't see our paths, it silently creates empty root-owned directories instead: no
+# login can be saved, a new SSH key appears every run, /workdir is empty. We drop a per-run
+# token in the config dir; the entrypoint refuses to start if it doesn't see it.
+MOUNT_TOKEN="$(date +%s)-$$-$RANDOM"
+printf '%s\n' "$MOUNT_TOKEN" > "$CONFIG_DIR/.ccd-mount-check"
+RUN_FLAGS+=(-e CCD_MOUNT_TOKEN="$MOUNT_TOKEN" -e CCD_HOST_CONFIG_DIR="$CONFIG_DIR")
+RUN_FLAGS+=(-e CCD_DOCKER_HOST_HINT="${DOCKER_HOST:-local socket}")
+
 "${NOCONV[@]}" "${DOCKER_RUN[@]}" run "${RUN_FLAGS[@]}" \
   -v "$(to_host_path "$MOUNT_SRC")":/workdir \
   -v "$(to_host_path "$CONFIG_DIR")":/home/claude/.claude \
