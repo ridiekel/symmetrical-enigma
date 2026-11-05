@@ -382,6 +382,13 @@ seccomp/apparmor) or the [sysbox](https://github.com/nestybox/sysbox) runtime on
    `localhost` and the Ryuk reaper works.
 4. **macOS**: sets `TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal`,
    so testcontainers finds the started containers via the host.
+5. **Daemon over TCP** (`DOCKER_HOST=tcp://...`, e.g. a dind sidecar at `tcp://dind:2376`):
+   there is no socket to mount. `ccd` passes `DOCKER_HOST`, `DOCKER_TLS_VERIFY`/`DOCKER_TLS`
+   and the client certs from `$DOCKER_CERT_PATH` (default `~/.docker`) into the container —
+   the certs as env vars, because a bind mount would be resolved on the daemon's filesystem.
+   The entrypoint writes them to `~/.docker` in the container. The container runs with
+   `--network host`, i.e. in the *daemon's* network namespace, so published ports are on
+   `localhost` and the daemon's hostname resolves as it does on the daemon.
 
 **DinD (`--dind`)** — fully isolated from the host Docker:
 

@@ -535,7 +535,27 @@ case "$DOCKER_MODE" in
     ;;
   *) # 1, host, dood, ...
     ctx_host="$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)"
-    if [ "$OS" = "Linux" ]; then
+    endpoint="${DOCKER_HOST:-$ctx_host}"
+    if [ "${endpoint#tcp://}" != "$endpoint" ]; then
+      # The daemon is reached over TCP (e.g. a dind sidecar: DOCKER_HOST=tcp://dind:2376).
+      # There is no socket to mount — the ccd container itself runs *on* that daemon, so we
+      # hand it the same client config we use here: endpoint, TLS switches and certs.
+      RUN_FLAGS+=(-e DOCKER_HOST="$endpoint")
+      [ -n "${DOCKER_TLS_VERIFY:-}" ] && RUN_FLAGS+=(-e DOCKER_TLS_VERIFY="$DOCKER_TLS_VERIFY")
+      [ -n "${DOCKER_TLS:-}" ] && RUN_FLAGS+=(-e DOCKER_TLS="$DOCKER_TLS")
+      # Certs go in as env vars, not as a bind mount: a bind mount would be resolved on the
+      # daemon's filesystem, where our ~/.docker usually doesn't exist. The entrypoint writes
+      # them to ~claude/.docker and drops the variables before starting claude.
+      cert_dir="${DOCKER_CERT_PATH:-$HOME/.docker}"
+      for f in ca cert key; do
+        if [ -r "$cert_dir/$f.pem" ]; then
+          RUN_FLAGS+=(-e "CCD_DOCKER_TLS_$(echo "$f" | tr a-z A-Z)=$(base64 < "$cert_dir/$f.pem" | tr -d '\n')")
+        fi
+      done
+      # Share the daemon's network stack: ports that testcontainers publishes then land on
+      # the same localhost, and the daemon's hostname (e.g. 'dind') resolves as it does there.
+      RUN_FLAGS+=(--network host)
+    elif [ "$OS" = "Linux" ]; then
       # On Linux the daemon runs on the host: mount the real socket path. We ask
       # the active docker context for the endpoint (rootless uses e.g.
       # $XDG_RUNTIME_DIR/docker.sock) and fall back to the default path.

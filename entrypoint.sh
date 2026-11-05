@@ -100,6 +100,24 @@ if [ "${CCD_DOCKER_MODE:-}" = "dind" ]; then
   fi
 fi
 
+# DooD over TCP (ccd --docker with DOCKER_HOST=tcp://...): 'ccd' passes the client TLS certs
+# as base64 env vars. Write them where the docker CLI and testcontainers look by default
+# (~/.docker) and drop the variables so the private key doesn't linger in claude's env.
+if [ -n "${CCD_DOCKER_TLS_CA:-}${CCD_DOCKER_TLS_CERT:-}${CCD_DOCKER_TLS_KEY:-}" ]; then
+  CERT_DIR="$USER_HOME/.docker"
+  install -d -m 700 -o "$USER_NAME" -g "$(id -g "$USER_NAME")" "$CERT_DIR"
+  for pair in ca:CCD_DOCKER_TLS_CA cert:CCD_DOCKER_TLS_CERT key:CCD_DOCKER_TLS_KEY; do
+    var="${pair#*:}"
+    val="${!var:-}"
+    [ -n "$val" ] || continue
+    printf '%s' "$val" | base64 -d > "$CERT_DIR/${pair%%:*}.pem"
+    chmod 600 "$CERT_DIR/${pair%%:*}.pem"
+    chown "$USER_NAME:$(id -g "$USER_NAME")" "$CERT_DIR/${pair%%:*}.pem"
+  done
+  export DOCKER_CERT_PATH="$CERT_DIR"
+  unset CCD_DOCKER_TLS_CA CCD_DOCKER_TLS_CERT CCD_DOCKER_TLS_KEY
+fi
+
 # Docker socket access: if the host socket is mounted (ccd --docker), make sure 'claude'
 # can reach it. We look up the gid of the socket and put 'claude' in a group with that gid
 # (the gid on the host rarely matches an existing group in the container).
