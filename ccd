@@ -64,6 +64,8 @@ to_unix_path() {
 #   --no-update               skip the auto-update check against GitHub for this run
 #   --no-clipboard            don't set up the host clipboard bridge (image paste)
 #   --no-m2                   don't mount the host Maven repository (~/.m2)
+#   --host-net                run with --network host: localhost in the container is the
+#                             host's localhost (see the security note in the README)
 #   --mount SRC[:DST][:ro]    mount an extra host directory (repeatable); DST defaults
 #                             to /mnt/<basename of SRC>. Also via CCD_MOUNTS (comma-separated).
 DOCKER_MODE=""
@@ -73,6 +75,7 @@ UPDATE_ALIAS=0
 NO_UPDATE=0
 NO_CLIPBOARD=0
 NO_M2=0
+HOST_NET=0
 EXTRA_MOUNTS=()
 CLAUDE_ARGS=()
 while [ $# -gt 0 ]; do
@@ -86,6 +89,7 @@ while [ $# -gt 0 ]; do
     --no-update) NO_UPDATE=1 ;;
     --no-clipboard) NO_CLIPBOARD=1 ;;
     --no-m2)     NO_M2=1 ;;
+    --host-net)  HOST_NET=1 ;;
     --mount)     if [ $# -lt 2 ]; then
                    echo "--mount needs an argument: SRC[:DST][:ro]" >&2
                    exit 1
@@ -592,6 +596,20 @@ case "$DOCKER_MODE" in
     fi
     ;;
 esac
+
+# --host-net: share the host's network stack, so services on the host's localhost are
+# reachable as localhost here. Opt-in, because it also opens up everything else that only
+# listens on loopback (unauthenticated dev databases, debug ports, ...), abstract unix
+# sockets such as X11's, and any port Claude opens lands on the host's real interfaces.
+# "The host" is the Docker daemon's network namespace: with a dind sidecar that is the
+# dind container, not the machine you run ccd on.
+if [ "$HOST_NET" = "1" ]; then
+  has_host_net=0
+  for ((i = 0; i < ${#RUN_FLAGS[@]} - 1; i++)); do
+    [ "${RUN_FLAGS[i]}" = "--network" ] && [ "${RUN_FLAGS[i+1]}" = "host" ] && has_host_net=1
+  done
+  [ "$has_host_net" = "1" ] || RUN_FLAGS+=(--network host)
+fi
 
 # ---------------------------------------------------------------------------
 # Clipboard bridge (image paste)

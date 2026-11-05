@@ -335,6 +335,7 @@ image has nothing to talk to.
 | ---- | ---- | ------------ |
 | `--docker` or `--docker=host` | **DooD** (Docker-outside-of-Docker) | Mounts the host Docker socket; testcontainers run as *siblings* on the host daemon. |
 | `--docker=dind` or `--dind` | **DinD** (Docker-in-Docker) | Starts its own daemon *in* the container, fully separate from the host. |
+| `--host-net` | network | Runs with `--network host`, so `localhost` is the host's localhost — see [Reaching host services](#reaching-host-services---host-net). |
 | `--mount SRC[:DST][:ro]` | mounts | Mounts an extra host directory in the container (repeatable) — see [Extra mounts](#extra-mounts---mount). |
 | `--prune` | **DinD** + cleanup | Cleans up the DinD image store and exits (implies `--dind`). |
 | `--rebuild` | build | Forces a clean rebuild (`--no-cache`) of the local image and cleans up old images/build cache (volumes are kept). |
@@ -417,6 +418,37 @@ The volume itself keeps existing (now empty). To remove it entirely, you can als
 > host daemon, so a bind mount to a path *in* the ccd container (e.g. `/workdir/...`)
 > doesn't exist on the host. testcontainers' `MountableFile`/`withCopyFileToContainer`
 > (copying) does work. In DinD this isn't an issue, since the daemon lives in the same container.
+
+### Reaching host services (`--host-net`)
+
+By default the container has its own network: `localhost` in there is the container
+itself, so a database or API on your host's `localhost` is out of reach.
+
+```bash
+ccd --host-net
+```
+
+runs the container with `--network host`, so `localhost:5432` reaches the host's port 5432.
+`--docker` on Linux and with a TCP daemon already does this; `--host-net` is for when you
+want it without Docker access.
+
+> **Note (security):** this is not root on the host, but it does weaken the sandbox.
+> The container can reach *everything* that listens on the host's loopback — often
+> without authentication, precisely because it's "only localhost" (dev databases, Redis,
+> Jupyter, Chrome/IDE debug ports, `kubectl proxy`, a Docker API on tcp/2375). Abstract
+> unix sockets live in the network namespace too, so e.g. the X11 socket becomes reachable.
+> And any port Claude opens is bound to the host's real interfaces, so a dev server on
+> `0.0.0.0` is visible on your LAN.
+
+A narrower alternative, without the flag: let the host service also listen on the Docker
+bridge (`172.17.0.1`) and reach it from the container via that address. On Docker
+Desktop, `host.docker.internal` already points to the host.
+
+"The host" is the Docker daemon's network namespace. With a dind sidecar
+(`DOCKER_HOST=tcp://dind:2376`) that's the dind container, not the machine you run `ccd`
+on; reach services there via their compose service name instead. On macOS, Docker Desktop
+only supports host networking with the feature enabled in its settings, and even then
+"host" is the VM.
 
 ### Pasting images (clipboard bridge)
 
