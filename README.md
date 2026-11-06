@@ -26,9 +26,10 @@ Starting the container
 ```bash
 ccd                 # interactive Claude Code session in the current directory
 ccd -p "fix the failing test"
+vibed               # the same container, but with Mistral Vibe instead of Claude Code
 ```
 
-The installer puts `ccd` in `~/.local/bin` and adds that to your `PATH` — open a new shell
+The installer puts `ccd` (and `vibed`, see [Mistral Vibe](#mistral-vibe-vibed)) in `~/.local/bin` and adds that to your `PATH` — open a new shell
 afterwards. The first `ccd` builds the image (that takes a while); after that `ccd`
 [updates itself](#auto-update) from GitHub on every start and rebuilds only when the build
 files changed. See [Installation](#installation) for options and the development setup.
@@ -38,6 +39,7 @@ files changed. See [Installation](#installation) for options and the development
 Based on `ubuntu:26.04`, including:
 
 - **Claude Code** (`@anthropic-ai/claude-code`) + `yarn` / `pnpm`
+- **Mistral Vibe** (`mistral-vibe`), started with [`vibed`](#mistral-vibe-vibed)
 - **Node.js LTS**, **Python 3** (`pip`, `venv`, `pipx`)
 - **GraalVM 25** (full JDK + `native-image`) and **Maven** via SDKMAN
 - Tooling: `git`, `git-lfs`, `ripgrep`, `fd`, `fzf`, `jq`, `gitleaks`, `build-essential`, …
@@ -234,6 +236,36 @@ therefore lost ("configuration file not found"). That's why the image sets
 `CLAUDE_CONFIG_DIR=/home/claude/.claude`, so `.claude.json` plus `projects/`,
 `sessions/` and `backups/` all end up *in* the mounted directory and are kept between
 sessions.
+
+### Mistral Vibe (`vibed`)
+
+The image also contains [Mistral Vibe](https://github.com/mistralai/mistral-vibe). `vibed`
+is the same script as `ccd` under a second name (the installer puts both on your `PATH`);
+it starts `vibe` instead of `claude` and otherwise does exactly the same: same image, same
+mounts, same flags (`--docker`, `--dind`, `--host-net`, `--mount`, `--rebuild`, …).
+Everything that isn't a ccd flag is passed through to `vibe`:
+
+```bash
+vibed                          # interactive Vibe session in the current directory
+vibed -p "fix the failing test"
+vibed --docker                 # with access to the host Docker daemon
+```
+
+- **API key**: on the first run Vibe asks for your Mistral API key and saves it in
+  `~/.vibe/.env`. Alternatively set `MISTRAL_API_KEY` on the host; `vibed` only forwards it
+  when it is set (it then takes precedence over the saved key).
+- **Persistent config**: `~/.vibe` (`config.toml`, `.env`, trusted folders, session logs)
+  lives in `<config dir>/vibe` on the host — `~/.config/claude-docker/vibe` by default, so
+  a [profile](#multiple-accounts-profiles) has its own Vibe config too. It is mounted for
+  `ccd` sessions as well, so Claude can read or adjust the Vibe config.
+- **Updates**: Vibe's own update check is turned off in the image
+  (`VIBE_ENABLE_UPDATE_CHECKS=false`): like Claude Code it is installed root-owned, so an
+  in-container upgrade can't work. `vibed --rebuild` (or the periodic max-age rebuild)
+  installs the latest version. Pin a version with
+  `docker build --build-arg MISTRAL_VIBE_VERSION=3.1.0 ...`.
+- **Already installed?** The auto-update brings the new image along, but only the
+  installer creates the `vibed` command: run the [install command](#installation) once
+  more (or `./install.sh` in your clone). Setting `CCD_AGENT=vibe ccd` works as well.
 
 ### Multiple accounts (profiles)
 
@@ -545,8 +577,8 @@ yourself and point `CLAUDE_IMAGE` at it (see
 | ------------------ | ----------------------------------------------------------- |
 | `Dockerfile`       | Builds the Claude Code image                                |
 | `ccd`              | Wrapper that starts Docker and runs the container           |
-| `install.sh`       | Installs `ccd` (via `curl \| sh` or from a clone) and puts it on your `PATH` |
-| `entrypoint.sh`    | Container startup: uid/gid mapping, SSH, Docker mode, starts `claude` |
+| `install.sh`       | Installs `ccd` and `vibed` (via `curl \| sh` or from a clone) and puts them on your `PATH` |
+| `entrypoint.sh`    | Container startup: uid/gid mapping, SSH, Docker mode, starts `claude` (or `vibe` for `vibed`) |
 
 ## Troubleshooting
 

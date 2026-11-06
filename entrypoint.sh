@@ -239,6 +239,15 @@ exit "$rc"
 CCD_XCLIP_SHIM
 chmod 0755 /usr/local/bin/xclip
 
-# Drop privileges to 'claude' and start Claude Code
+# Which agent to start: Claude Code by default, Mistral Vibe when ccd was invoked as 'vibed'
+# (it passes CCD_AGENT=vibe). A whitelist, not "run whatever the variable says".
+case "${CCD_AGENT:-claude}" in
+  claude) AGENT_CMD=claude ;;
+  vibe)   AGENT_CMD=vibe ;;
+  *)      echo "ccd: unknown CCD_AGENT '${CCD_AGENT}' (expected 'claude' or 'vibe')." >&2
+          exit 1 ;;
+esac
+
+# Drop privileges to 'claude' and start the agent
 # (login shell so SDKMAN/Java/Maven are on PATH)
-exec gosu "$USER_NAME" bash -lc 'exec claude "$@"' -- "$@"
+exec gosu "$USER_NAME" bash -lc 'exec "$0" "$@"' "$AGENT_CMD" "$@"

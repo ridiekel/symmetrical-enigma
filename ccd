@@ -15,6 +15,23 @@ while [ -h "$SOURCE" ]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
 
+# Which agent runs in the container. The same script is installed twice: as 'ccd' (Claude
+# Code) and as 'vibed' (Mistral Vibe) — a symlink, so we look at the name we were *invoked*
+# by ($0, not the resolved $SOURCE). CCD_AGENT wins: the Windows wrapper sets it, because
+# its exec loses the name, and we export it so the re-exec after a self-update (which goes
+# through "$SCRIPT_DIR/ccd") stays in the same mode.
+if [ -z "${CCD_AGENT:-}" ]; then
+  case "$(basename "$0")" in
+    vibed|vibed.*) CCD_AGENT=vibe ;;
+    *)             CCD_AGENT=claude ;;
+  esac
+fi
+case "$CCD_AGENT" in
+  claude|vibe) ;;
+  *) echo "Unknown CCD_AGENT '$CCD_AGENT' (expected 'claude' or 'vibe')." >&2; exit 1 ;;
+esac
+export CCD_AGENT
+
 # ---------------------------------------------------------------------------
 # Platform
 # ---------------------------------------------------------------------------
@@ -265,6 +282,13 @@ SSH_DIR="$CONFIG_DIR/ssh"
 mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 
+# Mistral Vibe's home (~/.vibe: config.toml, the API key in .env, trusted folders, session
+# logs), kept per profile next to the SSH directory. Mounted for both agents, so a Claude
+# session can read or edit the Vibe config too. 700: .env holds the API key.
+VIBE_DIR="$CONFIG_DIR/vibe"
+mkdir -p "$VIBE_DIR"
+chmod 700 "$VIBE_DIR"
+
 docker_running() {
   docker info >/dev/null 2>&1
 }
@@ -432,6 +456,13 @@ if [ "$IS_WINDOWS" = "1" ] && [ -t 0 ]; then
   fi
 fi
 [ -n "${ANTHROPIC_API_KEY:-}" ] && RUN_FLAGS+=(-e ANTHROPIC_API_KEY)
+
+# The entrypoint starts 'claude' or 'vibe' based on this.
+RUN_FLAGS+=(-e CCD_AGENT="$CCD_AGENT")
+
+# Mistral Vibe: same rule as ANTHROPIC_API_KEY — only forward when set, so an empty value
+# doesn't shadow the key Vibe saved in ~/.vibe/.env (env takes precedence over that file).
+[ -n "${MISTRAL_API_KEY:-}" ] && RUN_FLAGS+=(-e MISTRAL_API_KEY)
 
 # Forward the GitHub token so 'gh' (api/pr/...) is authenticated right away. In a
 # --rm container there is no 'gh auth login' state, so without a token every gh call fails.
@@ -939,5 +970,6 @@ RUN_FLAGS+=(-e CCD_DOCKER_HOST_HINT="${DOCKER_HOST:-local socket}")
   -v "$(to_host_path "$MOUNT_SRC")":/workdir \
   -v "$(to_host_path "$CONFIG_DIR")":/home/claude/.claude \
   -v "$(to_host_path "$SSH_DIR")":/home/claude/.ssh \
+  -v "$(to_host_path "$VIBE_DIR")":/home/claude/.vibe \
   -w "$WORKDIR_IN" \
   "$IMAGE" "$@"

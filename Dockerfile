@@ -245,6 +245,28 @@ RUN set -eux; \
     install -m 0755 gitleaks /usr/local/bin/gitleaks; \
     rm -f "$tarball" gitleaks; \
     gitleaks version
+
+# Mistral Vibe, Mistral's coding agent CLI ('vibe'); started by the 'vibed' wrapper, which is
+# ccd under another name. Installed the way upstream recommends ('uv tool install'), but
+# into /opt with the launcher in /usr/local/bin, so the 'claude' user (any uid) can run it.
+# Only for this RUN: as image ENV those UV_TOOL_* paths would also send claude's own
+# 'uv tool install' into root-owned /opt. Ubuntu's Python 3 satisfies Vibe's >=3.12; should
+# uv still want its own interpreter, UV_PYTHON_INSTALL_DIR keeps that out of /root as well.
+# Late, separate layer for the same cache reason as above; refreshed on 'ccd --rebuild' and
+# the periodic max-age rebuild. Pin with '--build-arg MISTRAL_VIBE_VERSION=3.1.0'.
+ARG MISTRAL_VIBE_VERSION=latest
+RUN set -eux; \
+    spec=mistral-vibe; \
+    [ "$MISTRAL_VIBE_VERSION" = latest ] || spec="mistral-vibe==${MISTRAL_VIBE_VERSION}"; \
+    UV_TOOL_DIR=/opt/uv/tools UV_TOOL_BIN_DIR=/usr/local/bin UV_PYTHON_INSTALL_DIR=/opt/uv/python \
+      UV_CACHE_DIR=/tmp/uv-cache uv tool install "$spec"; \
+    rm -rf /tmp/uv-cache /root/.vibe; \
+    vibe --version
+# Vibe's daily update check offers 'uv tool upgrade', which can't work here: the tool lives
+# in root-owned /opt and a --rm container would lose the upgrade anyway. Same story as
+# Claude Code's auto-updater above — 'ccd --rebuild' is the update path.
+ENV VIBE_ENABLE_UPDATE_CHECKS=false
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
