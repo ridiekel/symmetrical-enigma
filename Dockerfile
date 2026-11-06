@@ -207,9 +207,12 @@ USER root
 # rebuild of this image means downloading GraalVM and Chromium all over again.
 # libxtst6 (X Test extension) rides along in the same layer: Java AWT (java.awt.Robot,
 # non-headless Swing/AWT) refuses to load libawt_xawt.so without it.
+# zlib1g-dev likewise: GraalVM's native-image links against libz and fails with
+# "It appears as though libz:.a is missing" without the headers/static lib.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xclip wl-clipboard \
     libxtst6 \
+    zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # gitleaks, to scan a repo for committed secrets ('gitleaks git', 'gitleaks dir').
