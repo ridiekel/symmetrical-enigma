@@ -239,6 +239,49 @@ exit "$rc"
 CCD_XCLIP_SHIM
 chmod 0755 /usr/local/bin/xclip
 
+# Open a URL in the *host* browser, over the same bridge (op 'url'; see url_open in 'ccd').
+# Only http(s) gets through on the host side; we check here too, for a clear error.
+cat > /usr/local/bin/ccd-open-url <<'CCD_OPEN_URL'
+#!/bin/sh
+# ccd host-browser shim — see entrypoint.sh. Usage: ccd-open-url URL
+BRIDGE="${CCD_CLIP_BRIDGE:-/run/ccd-clipboard}"
+url="$1"
+case "$url" in
+  http://?*|https://?*) ;;
+  *) echo "ccd-open-url: only http(s) URLs can be opened on the host: $url" >&2; exit 1 ;;
+esac
+if [ ! -d "$BRIDGE" ]; then
+  echo "ccd-open-url: no bridge to the host — open this URL yourself: $url" >&2
+  exit 1
+fi
+
+id="$BRIDGE/$$-$(date +%s%N 2>/dev/null || date +%s)"
+cleanup() { rm -f "$id.op" "$id.req" "$id.out" "$id.rc" "$id.payload" 2>/dev/null; }
+trap 'cleanup; exit 1' INT TERM
+
+printf '%s\n' "$url" > "$id.payload" || { cleanup; exit 1; }
+printf 'url\n' > "$id.op" || { cleanup; exit 1; }
+: > "$id.req"
+
+waited=0
+limit=$(( ${CCD_CLIP_TIMEOUT:-10} * 20 ))
+while [ ! -f "$id.rc" ]; do
+  waited=$(( waited + 1 ))
+  if [ "$waited" -gt "$limit" ]; then
+    cleanup
+    echo "ccd-open-url: the host did not answer — open this URL yourself: $url" >&2
+    exit 1
+  fi
+  sleep 0.05
+done
+
+rc="$(cat "$id.rc" 2>/dev/null || echo 1)"
+cleanup
+[ "$rc" = 0 ] || echo "ccd-open-url: the host could not open the URL — open it yourself: $url" >&2
+exit "$rc"
+CCD_OPEN_URL
+chmod 0755 /usr/local/bin/ccd-open-url
+
 # Which agent to start: Claude Code by default, Mistral Vibe when ccd was invoked as 'vibed'
 # (it passes CCD_AGENT=vibe). A whitelist, not "run whatever the variable says".
 case "${CCD_AGENT:-claude}" in
@@ -247,6 +290,14 @@ case "${CCD_AGENT:-claude}" in
   *)      echo "ccd: unknown CCD_AGENT '${CCD_AGENT}' (expected 'claude' or 'vibe')." >&2
           exit 1 ;;
 esac
+
+# Vibe signs in by opening a URL with Python's webbrowser module, which honours $BROWSER.
+# Only for Vibe (whose sign-in polls Mistral, so no callback has to reach the container):
+# whether Claude Code's /login would survive a host browser — an OAuth redirect to
+# localhost lands on the host, not here — is untested, so its current flow stays as is.
+if [ "$AGENT_CMD" = vibe ] && [ "${CCD_BROWSER_BRIDGE:-}" = 1 ] && [ -z "${BROWSER:-}" ]; then
+  export BROWSER=/usr/local/bin/ccd-open-url
+fi
 
 # Drop privileges to 'claude' and start the agent
 # (login shell so SDKMAN/Java/Maven are on PATH)

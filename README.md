@@ -249,10 +249,16 @@ Everything that isn't a ccd flag is passed through to `vibe`:
 vibed                          # interactive Vibe session in the current directory
 vibed -p "fix the failing test"
 vibed --docker                 # with access to the host Docker daemon
+vibed --no-browser             # don't open sign-in pages in the host browser
 ```
 
-- **API key**: on the first run Vibe asks for your Mistral API key and saves it in
-  `~/.vibe/.env`. Alternatively set `MISTRAL_API_KEY` on the host; `vibed` only forwards it
+- **Sign-in**: on the first run Vibe asks you to sign in or enter your Mistral API key, and
+  saves the key in `~/.vibe/.env`. Browser sign-in opens the page in your **host** browser
+  through the same bridge as [image paste](#pasting-images-clipboard-bridge) (`open` on
+  macOS, `xdg-open` on Linux, PowerShell on Windows/WSL). Only `http(s)` URLs get through.
+  Turn it off with `--no-browser` / `CCD_NO_BROWSER=1`; Vibe then fails to open the browser,
+  and you sign in with an API key instead.
+  You can also set `MISTRAL_API_KEY` on the host; `vibed` only forwards it
   when it is set (it then takes precedence over the saved key).
 - **Persistent config**: `~/.vibe` (`config.toml`, `.env`, trusted folders, session logs)
   lives in `<config dir>/vibe` on the host — `~/.config/claude-docker/vibe` by default, so

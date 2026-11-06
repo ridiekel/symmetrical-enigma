@@ -80,6 +80,7 @@ to_unix_path() {
 #                             ('claude --update' can't work in this image, see below)
 #   --no-update               skip the auto-update check against GitHub for this run
 #   --no-clipboard            don't set up the host clipboard bridge (image paste)
+#   --no-browser              don't let the container open URLs in the host browser
 #   --no-m2                   don't mount the host Maven repository (~/.m2)
 #   --host-net                run with --network host: localhost in the container is the
 #                             host's localhost (see the security note in the README)
@@ -91,6 +92,7 @@ REBUILD=0
 UPDATE_ALIAS=0
 NO_UPDATE=0
 NO_CLIPBOARD=0
+NO_BROWSER=0
 NO_M2=0
 HOST_NET=0
 EXTRA_MOUNTS=()
@@ -105,6 +107,7 @@ while [ $# -gt 0 ]; do
     --update)    REBUILD=1; UPDATE_ALIAS=1 ;;
     --no-update) NO_UPDATE=1 ;;
     --no-clipboard) NO_CLIPBOARD=1 ;;
+    --no-browser) NO_BROWSER=1 ;;
     --no-m2)     NO_M2=1 ;;
     --host-net)  HOST_NET=1 ;;
     --mount)     if [ $# -lt 2 ]; then
@@ -793,6 +796,69 @@ clip_write_image() {
   esac
 }
 
+# --- opening a URL in the host browser ----------------------------------------
+# Mistral Vibe signs in by opening a URL with Python's webbrowser module, which has no
+# browser to open in here. The entrypoint points $BROWSER at a shim that sends the URL over
+# this same bridge (op 'url'); we open it with the host's own opener. The sign-in itself
+# needs nothing else: Vibe polls Mistral for the result, there is no callback on localhost.
+URL_BACKEND=none
+url_detect_backend() {
+  URL_BACKEND=none
+  case "$OS" in
+    Darwin)
+      command -v open >/dev/null 2>&1 && URL_BACKEND=macos
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      clip_find_powershell && URL_BACKEND=windows
+      ;;
+    Linux)
+      # WSL: xdg-open in the distro would at best start a Linux browser via WSLg; the user's
+      # browser is the Windows one.
+      if grep -qi microsoft /proc/version 2>/dev/null && clip_find_powershell; then
+        URL_BACKEND=windows
+      elif command -v xdg-open >/dev/null 2>&1; then
+        URL_BACKEND=xdg
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# The container decides what URL we get, so only plain http(s) URLs pass: no file://, no
+# custom schemes that start a local handler, no whitespace or control characters, and
+# nothing outside the URL character set (which also keeps PowerShell quoting simple).
+url_is_safe() {
+  case "$1" in
+    http://?*|https://?*) ;;
+    *) return 1 ;;
+  esac
+  [ "${#1}" -le 8192 ] || return 1
+  case "$1" in *$'\n'*|*$'\r'*) return 1 ;; esac
+  printf '%s' "$1" | LC_ALL=C grep -Eq "^[A-Za-z0-9._~:/?#@!\$&'()*+,;=%[-]+\$"
+}
+
+url_open() {
+  local url
+  url="$(head -c 8193 "$1" 2>/dev/null | head -n1)" || return 1
+  url_is_safe "$url" || return 1
+  case "$URL_BACKEND" in
+    macos)   open "$url" >/dev/null 2>&1 ;;
+    windows) clip_ps "Start-Process '${url//\'/\'\'}'" >/dev/null 2>&1 ;;
+    xdg)
+      # xdg-open can stay attached to a freshly started browser until that browser exits,
+      # which would freeze the bridge (and the clipboard with it). Give it a moment to fail
+      # fast; if it is still running by then, the browser is evidently on its way.
+      xdg-open "$url" >/dev/null 2>&1 &
+      local pid=$! i
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$pid" 2>/dev/null || { wait "$pid"; return; }
+        sleep 0.2
+      done
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # The poller. One request = the files <id>.op (+ <id>.payload for a write) followed by an
 # empty <id>.req marker; we answer with <id>.out and finally <id>.rc, which is what the
 # shim waits for. Writing .rc last is the whole synchronisation: it only appears once the
@@ -810,6 +876,7 @@ clip_bridge_loop() {
         targets) clip_has_image && { printf 'image/png\n' > "$id.out"; rc=0; } ;;
         read)    clip_read_image "$id.out" && rc=0 ;;
         write)   clip_write_image "$id.payload" && rc=0 ;;
+        url)     url_open "$id.payload" && rc=0 ;;
       esac
       [ -f "$id.out" ] || : > "$id.out"
       rm -f "$marker"
@@ -828,21 +895,23 @@ clip_bridge_stop() {
 }
 
 clip_bridge_start() {
-  [ "$NO_CLIPBOARD" = "1" ] && return 0
-  [ -n "${CCD_NO_CLIPBOARD:-}" ] && return 0
-
-  clip_detect_backend
-  if [ "$CLIP_BACKEND" = "none" ]; then
-    # Only worth mentioning to someone sitting at a terminal — a headless/CI run has no
-    # clipboard to bridge and shouldn't get a warning every time.
-    if [ -t 0 ]; then
+  # The bridge carries two things: clipboard images and URLs for the host browser. Each has
+  # its own off switch; the bridge only stays home when neither has anything to do.
+  if [ "$NO_CLIPBOARD" != "1" ] && [ -z "${CCD_NO_CLIPBOARD:-}" ]; then
+    clip_detect_backend
+    if [ "$CLIP_BACKEND" = "none" ] && [ -t 0 ]; then
+      # Only worth mentioning to someone sitting at a terminal — a headless/CI run has no
+      # clipboard to bridge and shouldn't get a warning every time.
       echo "Note: no host clipboard tool found — pasting images into Claude Code won't work." >&2
       case "$OS" in
         Linux) echo "      On Linux install xclip (X11) or wl-clipboard (Wayland) on the host." >&2 ;;
       esac
     fi
-    return 0
   fi
+  if [ "$NO_BROWSER" != "1" ] && [ -z "${CCD_NO_BROWSER:-}" ]; then
+    url_detect_backend
+  fi
+  [ "$CLIP_BACKEND" = "none" ] && [ "$URL_BACKEND" = "none" ] && return 0
 
   local root="${XDG_CACHE_HOME:-$HOME/.cache}/ccd/clipboard"
   mkdir -p "$root" 2>/dev/null || return 0
@@ -871,6 +940,9 @@ clip_bridge_start() {
 
   RUN_FLAGS+=(-v "$(to_host_path "$CLIP_DIR")":"$CLIP_MOUNT")
   RUN_FLAGS+=(-e CCD_CLIP_BRIDGE="$CLIP_MOUNT")
+  # Tells the entrypoint to point $BROWSER at the bridge shim.
+  [ "$URL_BACKEND" != "none" ] && RUN_FLAGS+=(-e CCD_BROWSER_BRIDGE=1)
+  return 0
 }
 
 clip_bridge_start
