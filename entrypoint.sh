@@ -282,6 +282,25 @@ exit "$rc"
 CCD_OPEN_URL
 chmod 0755 /usr/local/bin/ccd-open-url
 
+# Vibe's terminal UI (vibe-rs) doesn't look at $BROWSER: it runs 'xdg-open URL' itself.
+# This shim sits in front of the real xdg-open (if any) on PATH and sends a single http(s)
+# URL to the host — but only when the entrypoint switched that on for this session (see
+# CCD_OPEN_URL_VIA_HOST below). Everything else goes to the real xdg-open, or fails, after
+# which Vibe shows the URL to copy.
+cat > /usr/local/bin/xdg-open <<'CCD_XDG_OPEN'
+#!/bin/sh
+# ccd xdg-open shim — see entrypoint.sh.
+if [ "${CCD_OPEN_URL_VIA_HOST:-}" = 1 ] && [ $# -eq 1 ]; then
+  case "$1" in
+    http://?*|https://?*) exec /usr/local/bin/ccd-open-url "$1" ;;
+  esac
+fi
+[ -x /usr/bin/xdg-open ] && exec /usr/bin/xdg-open "$@"
+echo "xdg-open: no browser available in this container: $*" >&2
+exit 1
+CCD_XDG_OPEN
+chmod 0755 /usr/local/bin/xdg-open
+
 # Which agent to start: Claude Code by default, Mistral Vibe when ccd was invoked as 'vibed'
 # (it passes CCD_AGENT=vibe). A whitelist, not "run whatever the variable says".
 case "${CCD_AGENT:-claude}" in
@@ -291,12 +310,16 @@ case "${CCD_AGENT:-claude}" in
           exit 1 ;;
 esac
 
-# Vibe signs in by opening a URL with Python's webbrowser module, which honours $BROWSER.
-# Only for Vibe (whose sign-in polls Mistral, so no callback has to reach the container):
+# Vibe signs in by opening a URL: its terminal UI through 'xdg-open' (the shim above), its
+# Python side through the webbrowser module, which honours $BROWSER. Only when ccd found a
+# way to open URLs on the host (CCD_BROWSER_BRIDGE), and only for Vibe (whose sign-in polls Mistral, so no callback has to reach the container):
 # whether Claude Code's /login would survive a host browser — an OAuth redirect to
 # localhost lands on the host, not here — is untested, so its current flow stays as is.
 if [ "$AGENT_CMD" = vibe ] && [ "${CCD_BROWSER_BRIDGE:-}" = 1 ] && [ -z "${BROWSER:-}" ]; then
   export BROWSER=/usr/local/bin/ccd-open-url
+fi
+if [ "$AGENT_CMD" = vibe ] && [ "${CCD_BROWSER_BRIDGE:-}" = 1 ]; then
+  export CCD_OPEN_URL_VIA_HOST=1
 fi
 
 # Drop privileges to 'claude' and start the agent

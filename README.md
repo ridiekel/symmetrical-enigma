@@ -256,8 +256,13 @@ vibed --no-browser             # don't open sign-in pages in the host browser
   saves the key in `~/.vibe/.env`. Browser sign-in opens the page in your **host** browser
   through the same bridge as [image paste](#pasting-images-clipboard-bridge) (`open` on
   macOS, `xdg-open` on Linux, PowerShell on Windows/WSL). Only `http(s)` URLs get through.
-  Turn it off with `--no-browser` / `CCD_NO_BROWSER=1`; Vibe then fails to open the browser,
-  and you sign in with an API key instead.
+  Turn it off with `--no-browser` / `CCD_NO_BROWSER=1`.
+  When `ccd` itself runs somewhere without a browser — for instance inside another
+  container, or over SSH — there is nothing to open the page with. Vibe then shows the URL:
+  pick **Copy URL to clipboard** (sent to your terminal as an OSC 52 escape, so it reaches the
+  clipboard of the machine you're sitting at, through any number of container layers, if your
+  terminal allows OSC 52 — Windows Terminal, iTerm2, kitty and WezTerm do), or use an API key
+  instead.
   You can also set `MISTRAL_API_KEY` on the host; `vibed` only forwards it
   when it is set (it then takes precedence over the saved key).
 - **Persistent config**: `~/.vibe` (`config.toml`, `.env`, trusted folders, session logs)
