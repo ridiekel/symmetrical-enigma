@@ -141,8 +141,9 @@ if [ "$PRUNE" = "1" ] && [ "$DOCKER_MODE" != "vm" ]; then DOCKER_MODE="dind"; fi
 # Auto-update from GitHub
 # ---------------------------------------------------------------------------
 # The installer drops 'ccd', 'Dockerfile' and 'entrypoint.sh' in ~/.local/share/ccd, so no
-# cloned repo is needed. On every start we compare those files with the raw files on GitHub
-# and replace whatever differs:
+# cloned repo is needed. On every start we look up the commit sha the branch points at; if it
+# differs from the one we installed (.ccd-sha), we download the files *at that sha* and
+# replace whatever differs:
 #   * changed Dockerfile/entrypoint.sh -> the build-hash check further down rebuilds the image;
 #   * a changed 'ccd'                  -> we re-exec ourselves, so the update applies right away.
 #
@@ -150,6 +151,11 @@ if [ "$PRUNE" = "1" ] && [ "$DOCKER_MODE" != "vm" ]; then DOCKER_MODE="dind"; fi
 # the version we already have. Skipped for a git checkout ($SCRIPT_DIR/.git) — there your own
 # working copy wins. Off with --no-update / CCD_NO_UPDATE=1; CCD_UPDATE_INTERVAL=<seconds>
 # limits how often we check (default 0 = every start).
+#
+# Why a sha and not just the branch: raw.githubusercontent.com/<repo>/<branch>/... sits behind
+# a CDN that caches for ~5 minutes, so a fresh push stayed invisible that long — and different
+# edge nodes could even hand out an older copy, which the cmp below would then "install".
+# A URL with a commit sha is immutable, so caching can't hurt it.
 UPDATE_FILES="ccd Dockerfile entrypoint.sh"
 
 fetch_url() {
@@ -162,6 +168,29 @@ fetch_url() {
   else
     return 1
   fi
+}
+
+# Print the commit sha that $2 (a branch) of GitHub repo $1 points at, or fail.
+#   1. 'git ls-remote': straight from GitHub's git server — not cached, no rate limit;
+#   2. the REST API with the 'sha' media type: a bare sha back, but cached up to 60s and
+#      limited to 60 unauthenticated calls per hour, hence only the fallback.
+resolve_sha() {
+  local repo="$1" branch="$2" sha=""
+  if command -v git >/dev/null 2>&1; then
+    sha="$(GIT_TERMINAL_PROMPT=0 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=10 \
+             ls-remote "https://github.com/$repo.git" "refs/heads/$branch" 2>/dev/null \
+           | awk 'NR == 1 { print $1 }')"
+  fi
+  if [ -z "$sha" ] && command -v curl >/dev/null 2>&1; then
+    sha="$(curl -fsSL --connect-timeout 5 --max-time 15 \
+             -H 'Accept: application/vnd.github.sha' \
+             "https://api.github.com/repos/$repo/commits/$branch" 2>/dev/null)"
+  fi
+  case "$sha" in
+    *[!0-9a-f]*|'') return 1 ;;
+  esac
+  [ "${#sha}" -eq 40 ] || return 1
+  printf '%s\n' "$sha"
 }
 
 self_update() {
@@ -197,9 +226,22 @@ self_update() {
     [ $(( now - last )) -lt "$interval" ] && return 0
   fi
 
-  local tmp base f changed=""
+  local tmp base f changed="" sha="" sha_file="$SCRIPT_DIR/.ccd-sha" source_label
+  if [ -n "$raw_base" ]; then
+    # Custom host: no sha to pin to, so compare against what it serves right now.
+    base="$raw_base"
+    source_label="$raw_base"
+  else
+    # No sha (offline, GitHub hiccup): skip this round rather than fall back to the
+    # cached branch URL, which could hand us an older copy than the one installed.
+    sha="$(resolve_sha "$repo" "$branch")" || return 0
+    : > "$stamp" 2>/dev/null || true
+    # Same commit as last time: nothing to download at all.
+    [ "$(cat "$sha_file" 2>/dev/null)" = "$sha" ] && return 0
+    base="https://raw.githubusercontent.com/$repo/$sha"
+    source_label="$repo@$branch, ${sha:0:7}"
+  fi
   tmp="$(mktemp -d)" || return 0
-  base="${raw_base:-https://raw.githubusercontent.com/$repo/$branch}"
 
   # First download everything; only apply when the whole set came through, so a failed
   # download never leaves a half-updated installation behind.
@@ -225,11 +267,13 @@ self_update() {
     cmp -s "$tmp/$f" "$SCRIPT_DIR/$f" || changed="$changed $f"
   done
   if [ -z "$changed" ]; then
+    # A new commit that didn't touch our files (README, install.sh, ...).
+    [ -n "$sha" ] && printf '%s\n' "$sha" > "$sha_file" 2>/dev/null
     rm -rf "$tmp"
     return 0
   fi
 
-  echo "Update found (${raw_base:-$repo@$branch}):${changed} — installing..."
+  echo "Update found ($source_label):${changed} — installing..."
   for f in $changed; do
     # 'mv' (rename) instead of writing over the file: bash keeps reading the *running*
     # script from its old inode, so overwriting in place would corrupt this session.
@@ -242,6 +286,9 @@ self_update() {
     fi
   done
   chmod +x "$SCRIPT_DIR/ccd" 2>/dev/null || true
+  # Only now, after every file is in place: a failed 'mv' above leaves the old sha, so the
+  # next start tries again.
+  [ -n "$sha" ] && printf '%s\n' "$sha" > "$sha_file" 2>/dev/null
   rm -rf "$tmp"
 
   case " $changed " in

@@ -101,7 +101,7 @@ curl -fsSL https://raw.githubusercontent.com/ridiekel/symmetrical-enigma/main/in
 | `BIN_DIR` | `~/.local/bin` | where the `ccd` command is linked |
 | `CCD_REPO` | `ridiekel/symmetrical-enigma` | install/update from a fork |
 | `CCD_BRANCH` | `main` | install/update from another branch |
-| `CCD_RAW_BASE` | raw GitHub URL of repo+branch | fetch from a completely different host (mirror, GitLab raw, `file://`) |
+| `CCD_RAW_BASE` | raw GitHub URL of the branch's latest commit | fetch from a completely different host (mirror, GitLab raw, `file://`) |
 
 `CCD_REPO`/`CCD_BRANCH`/`CCD_RAW_BASE` are stored in `$CCD_HOME/.ccd-source`, so a fork
 keeps updating itself from that fork.
@@ -132,15 +132,24 @@ the one on GitHub, every switch between the two triggers a rebuild.
 
 ### Auto-update
 
-At every start `ccd` compares its own three files (`ccd`, `Dockerfile`, `entrypoint.sh`)
-with the raw versions on GitHub and replaces whatever differs:
+At every start `ccd` asks GitHub which commit the branch points at (`git ls-remote`, with
+the GitHub API as fallback). Same commit as last time (`$CCD_HOME/.ccd-sha`) → nothing is
+downloaded. A new commit → `ccd` fetches its three files (`ccd`, `Dockerfile`,
+`entrypoint.sh`) *at that commit* and replaces whatever differs:
 
 - changed `Dockerfile`/`entrypoint.sh` → the image is **rebuilt automatically** on this run
   (the build hash below covers exactly those two files);
 - a changed `ccd` → the script restarts itself, so the new version handles this run.
 
+Pinning to the commit is what makes a push show up right away: the branch URLs on
+`raw.githubusercontent.com` are cached for about five minutes, a commit URL never changes.
+(The `curl … install.sh | sh` one-liner itself still comes through that cache; the files it
+installs don't.)
+
 The check fails soft: without a network, without `curl`/`wget` or with a GitHub hiccup you
-simply keep running on what you already have. It is skipped in a git checkout.
+simply keep running on what you already have — it never falls back to the cached branch
+URL, which could hand out an older copy. It is skipped in a git checkout. With
+`CCD_RAW_BASE` there is no commit to pin to; then the files are compared on every start.
 
 | Turn off / adjust | Effect |
 | ----------------- | ------ |

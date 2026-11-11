@@ -15,7 +15,9 @@ CMD_NAME="ccd"
 REPO="${CCD_REPO:-ridiekel/symmetrical-enigma}"
 BRANCH="${CCD_BRANCH:-main}"
 # Escape hatch: install from another host (mirror, GitLab raw, a local dir via file://).
-RAW_BASE="${CCD_RAW_BASE:-https://raw.githubusercontent.com/$REPO/$BRANCH}"
+# Without it we download from the commit the branch points at, not from the branch itself:
+# raw.githubusercontent.com caches branch URLs for ~5 minutes (see resolve_sha below).
+RAW_BASE="${CCD_RAW_BASE:-}"
 
 # Files ccd needs at runtime: itself plus the build files for the local image.
 FILES="ccd Dockerfile entrypoint.sh"
@@ -68,10 +70,41 @@ fetch() {
   fi
 }
 
+# The commit sha $BRANCH points at — same lookup as ccd's auto-update: 'git ls-remote'
+# (uncached), with GitHub's API as the fallback.
+resolve_sha() {
+  _sha=""
+  if command -v git >/dev/null 2>&1; then
+    _sha="$(GIT_TERMINAL_PROMPT=0 git ls-remote "https://github.com/$REPO.git" "refs/heads/$BRANCH" 2>/dev/null \
+            | awk 'NR == 1 { print $1 }')"
+  fi
+  if [ -z "$_sha" ] && command -v curl >/dev/null 2>&1; then
+    _sha="$(curl -fsSL --connect-timeout 5 --max-time 15 -H 'Accept: application/vnd.github.sha' \
+            "https://api.github.com/repos/$REPO/commits/$BRANCH" 2>/dev/null || true)"
+  fi
+  case "$_sha" in
+    *[!0-9a-f]*|'') return 1 ;;
+  esac
+  [ "${#_sha}" -eq 40 ] || return 1
+  echo "$_sha"
+}
+
 if [ "$MODE" = "remote" ]; then
   command -v bash >/dev/null 2>&1 || echo "Warning: 'bash' not found — 'ccd' itself needs bash." >&2
 
-  echo "Installing $CMD_NAME from $REPO@$BRANCH into $CCD_HOME ..."
+  SHA=""
+  if [ -z "$RAW_BASE" ]; then
+    if SHA="$(resolve_sha)"; then
+      RAW_BASE="https://raw.githubusercontent.com/$REPO/$SHA"
+    else
+      # Still installable, just possibly up to ~5 minutes behind; the first ccd start
+      # then catches up via its own (sha-based) update check.
+      echo "Warning: could not look up the latest commit — installing from the branch." >&2
+      RAW_BASE="https://raw.githubusercontent.com/$REPO/$BRANCH"
+    fi
+  fi
+
+  echo "Installing $CMD_NAME from $REPO@$BRANCH${SHA:+ ($(echo "$SHA" | cut -c1-7))} into $CCD_HOME ..."
   mkdir -p "$CCD_HOME"
 
   # Download everything to a temp dir first, so a failed download never leaves
@@ -90,6 +123,9 @@ if [ "$MODE" = "remote" ]; then
   # ccd reads this back for its own auto-update, so a fork keeps updating from the fork.
   printf 'repo=%s\nbranch=%s\n' "$REPO" "$BRANCH" > "$CCD_HOME/.ccd-source"
   [ -n "${CCD_RAW_BASE:-}" ] && printf 'raw_base=%s\n' "$CCD_RAW_BASE" >> "$CCD_HOME/.ccd-source"
+  # The commit we installed, so ccd's first update check doesn't download it all again.
+  # Without a sha (branch fallback) we remove a stale one, so that check does compare.
+  if [ -n "$SHA" ]; then echo "$SHA" > "$CCD_HOME/.ccd-sha"; else rm -f "$CCD_HOME/.ccd-sha"; fi
 fi
 
 SRC_SCRIPT="$SRC_DIR/$CMD_NAME"
