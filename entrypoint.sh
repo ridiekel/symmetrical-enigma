@@ -209,7 +209,7 @@ vm_start() {
   done
 
   cpus="${CCD_VM_CPUS:-$(nproc)}"
-  mem="${CCD_VM_MEMORY:-2G}"
+  mem="${CCD_VM_MEMORY:-8G}"
   append="root=/dev/vda rootfstype=ext4 modules=ext4,virtio_blk console=$console quiet"
   append="$append sysctl.net.ipv4.ip_local_port_range=\"$lo $hi\""
 

@@ -479,7 +479,7 @@ host
 | Shutdown | when Claude exits, the VM is powered off cleanly via the QEMU guest agent. A hard stop (`docker kill` of the ccd container) can corrupt the image store; `ccd` then reports the daemon crash and you start over with `docker volume rm claude-vm-data`. |
 
 Tuning (environment variables, passed on by `ccd`): `CCD_VM_CPUS` (default: all),
-`CCD_VM_MEMORY` (default `2G`), `CCD_VM_DISK` (data disk size on first creation, default
+`CCD_VM_MEMORY` (default `8G`), `CCD_VM_DISK` (data disk size on first creation, default
 `64G`, sparse), `CCD_VM_PORTS`, `CCD_VM_FORWARD`, `CCD_VM_TIMEOUT` (boot timeout in seconds).
 
 Caveats of the prototype: a forwarded port accepts the connection even when nothing listens
