@@ -73,7 +73,10 @@ to_unix_path() {
 #   --docker            Docker-in-Docker in DooD mode (host socket; siblings on the host daemon)
 #   --docker=host       same
 #   --docker=dind  / --dind   own Docker daemon *in* the container (fully isolated)
-#   --prune                   clean up the DinD image store (implies --dind) and exit afterwards
+#   --docker=vm    / --dind=vm   own Docker daemon in a QEMU microVM inside the container
+#                                (no --privileged; uses /dev/kvm when the host has it)
+#   --prune                   clean up the DinD image store (implies --dind, or the VM
+#                             store with --dind=vm) and exit afterwards
 #   --rebuild                 force a clean rebuild of the local image and afterwards
 #                             clean up the old images/build cache (volumes are kept)
 #   --update                  alias for --rebuild: the way to get a newer Claude Code
@@ -102,6 +105,13 @@ while [ $# -gt 0 ]; do
     --docker)    DOCKER_MODE="host" ;;
     --docker=*)  DOCKER_MODE="${1#--docker=}" ;;
     --dind)      DOCKER_MODE="dind" ;;
+    --dind=*)    DOCKER_MODE="${1#--dind=}"
+                 # Never let a typo fall through to DooD (host socket) further down.
+                 case "$DOCKER_MODE" in
+                   dind|vm) ;;
+                   *) echo "Unknown --dind mode '$DOCKER_MODE' (use --dind or --dind=vm)." >&2
+                      exit 1 ;;
+                 esac ;;
     --prune)     PRUNE=1 ;;
     --rebuild)   REBUILD=1 ;;
     --update)    REBUILD=1; UPDATE_ALIAS=1 ;;
@@ -123,8 +133,9 @@ while [ $# -gt 0 ]; do
 done
 set -- "${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}"
 
-# --prune works on the images in the DinD volume, so we always run in DinD mode.
-[ "$PRUNE" = "1" ] && DOCKER_MODE="dind"
+# --prune works on the images in the DinD (or VM) volume, so it needs one of those modes;
+# without an explicit --dind=vm it means DinD.
+if [ "$PRUNE" = "1" ] && [ "$DOCKER_MODE" != "vm" ]; then DOCKER_MODE="dind"; fi
 
 # ---------------------------------------------------------------------------
 # Auto-update from GitHub
@@ -559,9 +570,35 @@ fi
 #                                NOTE: socket access = effectively root on the host.
 #   --docker=dind | --dind    -> DinD: its own daemon *in* the container, separate from the host.
 #                                Fully isolated, but requires --privileged.
+#   --docker=vm | --dind=vm   -> its own daemon in a QEMU microVM inside the container. No
+#                                --privileged: the guest kernel is the boundary. Fast with
+#                                /dev/kvm (Linux), emulated (slow) without.
 case "$DOCKER_MODE" in
   "")
     : # off
+    ;;
+  vm)
+    # QEMU forwards the VM's Docker API (plain TCP, no auth) and its published ports to
+    # 127.0.0.1 in the container. With --host-net that is the *host's* loopback: open to every
+    # local user, and a second session would clash on the same ports.
+    if [ "$HOST_NET" = "1" ]; then
+      echo "--dind=vm can't be combined with --host-net: the VM's Docker API would be" >&2
+      echo "exposed on the host's localhost." >&2
+      exit 1
+    fi
+    RUN_FLAGS+=(-e CCD_DOCKER_MODE=vm)
+    if [ "$OS" = "Linux" ] && [ -c /dev/kvm ]; then
+      RUN_FLAGS+=(--device /dev/kvm)
+    else
+      echo "Note: no /dev/kvm on this host — the Docker VM will run emulated and be slow." >&2
+    fi
+    # The VM's Docker data disk, so pulled images survive the session.
+    RUN_FLAGS+=(-v claude-vm-data:/var/lib/ccd-vm)
+    # Tuning knobs, passed through only when set (see the README).
+    for var in CCD_VM_CPUS CCD_VM_MEMORY CCD_VM_DISK CCD_VM_PORTS CCD_VM_FORWARD CCD_VM_TIMEOUT; do
+      if [ -n "${!var:-}" ]; then RUN_FLAGS+=(-e "$var=${!var}"); fi
+    done
+    [ "$PRUNE" = "1" ] && RUN_FLAGS+=(-e CCD_PRUNE=1)
     ;;
   dind)
     RUN_FLAGS+=(--privileged -e CCD_DOCKER_MODE=dind)

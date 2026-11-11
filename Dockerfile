@@ -1,3 +1,69 @@
+# ---------------------------------------------------------------------------
+# Stage 1: the microVM for 'ccd --dind=vm'
+# ---------------------------------------------------------------------------
+# A minimal Alpine guest (kernel + initramfs + root disk) that runs dockerd. 'ccd --dind=vm'
+# boots it with QEMU inside the (unprivileged) ccd container, so the containers Claude starts
+# live behind a real kernel boundary instead of on a --privileged daemon. Built as its own
+# stage so none of the Alpine tooling ends up in the final image — only the three artifacts
+# in /out are copied over (see the end of the file).
+#
+# The root disk is built with 'mkfs.ext4 -d' (no loop mount needed, so this works in an
+# unprivileged build) and shipped as a compressed qcow2. At runtime QEMU opens it with
+# snapshot=on: the guest root starts clean every session, while /var/lib/docker lives on a
+# separate data disk in a volume.
+FROM alpine:3.24 AS ccd-vm
+RUN set -eux; \
+    apk add --no-cache e2fsprogs qemu-img; \
+    R=/rootfs; \
+    mkdir -p "$R/etc/apk"; \
+    cp -r /etc/apk/keys /etc/apk/repositories "$R/etc/apk/"; \
+    apk add --root "$R" --initdb --no-cache \
+      alpine-base linux-virt e2fsprogs docker docker-openrc qemu-guest-agent; \
+    # Boot services. --initdb leaves every runlevel empty, so we wire them up ourselves.
+    for s in devfs dmesg mdev hwdrivers; do ln -s "/etc/init.d/$s" "$R/etc/runlevels/sysinit/$s"; done; \
+    for s in modules sysctl hostname bootmisc fsck root localmount networking cgroups; do \
+      ln -s "/etc/init.d/$s" "$R/etc/runlevels/boot/$s"; done; \
+    for s in qemu-guest-agent docker local; do ln -s "/etc/init.d/$s" "$R/etc/runlevels/default/$s"; done; \
+    for s in mount-ro killprocs savecache; do ln -s "/etc/init.d/$s" "$R/etc/runlevels/shutdown/$s"; done; \
+    echo ccd-vm > "$R/etc/hostname"; \
+    printf 'auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp\n' > "$R/etc/network/interfaces"; \
+    # vda = root (snapshot), vdb = docker data (volume), 'workdir' = the repo via 9p, mounted
+    # at the same path as in the ccd container so bind mounts of /workdir/... just work.
+    printf '%s\n' \
+      '/dev/vda / ext4 rw,relatime 0 0' \
+      '/dev/vdb /var/lib/docker ext4 rw,relatime,nofail 0 2' \
+      'workdir /workdir 9p trans=virtio,version=9p2000.L,msize=524288,nofail 0 0' \
+      > "$R/etc/fstab"; \
+    mkdir -p "$R/workdir" "$R/var/lib/docker"; \
+    printf '9pnet_virtio\n9p\n' >> "$R/etc/modules"; \
+    # The Docker API is published on TCP inside the guest; QEMU forwards it to 127.0.0.1:2375
+    # in the ccd container only. Plain TCP is fine here: nothing outside the VM and the ccd
+    # container can reach it.
+    printf 'DOCKER_OPTS="-H unix:///var/run/docker.sock -H tcp://0.0.0.0:2375 --tls=false"\n' \
+      >> "$R/etc/conf.d/docker"; \
+    # The guest agent is how ccd shuts the VM down cleanly (unmounting the data disk) when
+    # the session ends. Not the ACPI power button: arm64's 'virt' machine signals that via
+    # gpio-keys, which Alpine's linux-virt doesn't ship.
+    printf 'virtio_console\n' >> "$R/etc/modules"; \
+    # Mirror dockerd's log to the serial console: ccd watches that file, so it can fail
+    # fast — and show why — when the daemon in the VM doesn't come up.
+    printf '#!/bin/sh\ntail -n +1 -F /var/log/docker.log > /dev/console 2>&1 &\n' \
+      > "$R/etc/local.d/docker-console.start"; \
+    chmod 0755 "$R/etc/local.d/docker-console.start"; \
+    # No logins on the guest: drop the gettys, the serial console is only a log.
+    sed -i -e '/getty/d' "$R/etc/inittab"; \
+    kver="$(ls "$R/lib/modules")"; \
+    chroot "$R" mkinitfs -o /boot/initramfs-virt "$kver"; \
+    mkdir -p /out; \
+    cp "$R/boot/vmlinuz-virt" "$R/boot/initramfs-virt" /out/; \
+    rm -rf "$R/boot"/* "$R/var/cache/apk"/*; \
+    mkfs.ext4 -q -L ccd-vm-root -d "$R" /out/root.img 1G; \
+    qemu-img convert -c -O qcow2 /out/root.img /out/root.qcow2; \
+    rm /out/root.img; \
+    # mkinitfs writes the initramfs 0600; QEMU runs as 'claude' and has to read it.
+    chmod 0644 /out/*; \
+    ls -la /out
+
 FROM ubuntu:26.04
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -266,6 +332,20 @@ RUN set -eux; \
 # in root-owned /opt and a --rm container would lose the upgrade anyway. Same story as
 # Claude Code's auto-updater above — 'ccd --rebuild' is the update path.
 ENV VIBE_ENABLE_UPDATE_CHECKS=false
+
+# QEMU for 'ccd --dind=vm' (only the system emulator for this image's own architecture),
+# plus the guest from the 'ccd-vm' stage. e2fsprogs formats the VM's Docker data disk on
+# first use. Late layers for the same cache reason as above.
+RUN set -eux; \
+    case "$(uname -m)" in \
+      x86_64)  qemu=qemu-system-x86 ;; \
+      aarch64) qemu=qemu-system-arm ;; \
+      *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends "$qemu" e2fsprogs; \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=ccd-vm /out/ /opt/ccd-vm/
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

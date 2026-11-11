@@ -366,11 +366,11 @@ then skips the automatic generation.
 ### Docker-in-Docker (testcontainers, docker compose)
 
 Sometimes you run tests that start Docker containers themselves (e.g. [testcontainers](https://testcontainers.com/)
-or `docker compose`). Because Claude Code already runs *in* a container, `ccd` offers two
+or `docker compose`). Because Claude Code already runs *in* a container, `ccd` offers three
 modes for that via a startup flag. The `docker` CLI, the daemon binaries and the compose plugin
 are already in the image.
 
-Both modes are **opt-in per run**. Without a flag the container is unprivileged and has no
+All modes are **opt-in per run**. Without a flag the container is unprivileged and has no
 Docker access at all: no socket is mounted and no daemon runs, so the `docker` CLI in the
 image has nothing to talk to.
 
@@ -378,9 +378,10 @@ image has nothing to talk to.
 | ---- | ---- | ------------ |
 | `--docker` or `--docker=host` | **DooD** (Docker-outside-of-Docker) | Mounts the host Docker socket; testcontainers run as *siblings* on the host daemon. |
 | `--docker=dind` or `--dind` | **DinD** (Docker-in-Docker) | Starts its own daemon *in* the container, fully separate from the host. |
+| `--docker=vm` or `--dind=vm` | **VM** (prototype) | Starts its own daemon in a QEMU microVM *inside* the container — no `--privileged`. See [VM mode](#vm-mode---dindvm-prototype). |
 | `--host-net` | network | Runs with `--network host`, so `localhost` is the host's localhost — see [Reaching host services](#reaching-host-services---host-net). |
 | `--mount SRC[:DST][:ro]` | mounts | Mounts an extra host directory in the container (repeatable) — see [Extra mounts](#extra-mounts---mount). |
-| `--prune` | **DinD** + cleanup | Cleans up the DinD image store and exits (implies `--dind`). |
+| `--prune` | **DinD**/**VM** + cleanup | Cleans up the DinD image store and exits (implies `--dind`; combine with `--dind=vm` for the VM's store). |
 | `--rebuild` | build | Forces a clean rebuild (`--no-cache`) of the local image and cleans up old images/build cache (volumes are kept). |
 | `--update` | build | Alias for `--rebuild`: the way to get a newer Claude Code. Errors out when `CLAUDE_IMAGE` pins an image (see [Updating Claude Code](#updating-claude-code)). |
 | `--no-update` | update | Skips the auto-update check against GitHub for this run. |
@@ -390,9 +391,11 @@ The flag goes before the arguments for `claude`; everything else `ccd` passes th
 ```bash
 ccd --docker -p "run the integration tests"   # host daemon (DooD)
 ccd --dind   -p "run the integration tests"   # own daemon (DinD)
+ccd --dind=vm -p "run the integration tests"  # own daemon in a microVM
 ```
 
-> **Note (security): neither mode is a boundary against your machine.** DooD hands the
+> **Note (security): DooD and DinD are not a boundary against your machine** — VM mode is
+> the one that is (see below). DooD hands the
 > container the host Docker socket, and with it the ability to start a privileged container
 > on the host daemon. DinD needs `--privileged` because a real `dockerd` has to mount the
 > overlay storage driver, write to `/sys/fs/cgroup`, set up `iptables`/bridge networking and
@@ -408,7 +411,8 @@ ccd --dind   -p "run the integration tests"   # own daemon (DinD)
 Removing `--privileged` from DinD doesn't make it safer — it stops working. `dockerd` fails
 during startup, the entrypoint waits 30 seconds, dumps the daemon log and exits. Unprivileged
 DinD would need rootless `dockerd` (`/dev/fuse`, cgroup delegation, unconfined
-seccomp/apparmor) or the [sysbox](https://github.com/nestybox/sysbox) runtime on the host.
+seccomp/apparmor) or the [sysbox](https://github.com/nestybox/sysbox) runtime on the host —
+or a VM, which is what `--dind=vm` does.
 
 **DooD (`--docker`)** — fast, and shares images with the host:
 
@@ -440,6 +444,41 @@ seccomp/apparmor) or the [sysbox](https://github.com/nestybox/sysbox) runtime on
 2. testcontainers connect via `localhost` inside the container — no extra network config needed.
 3. Pulled images are kept in a named volume `claude-dind-data` (mounted at
    `/var/lib/docker`), so a next run doesn't have to download everything again.
+
+#### VM mode (`--dind=vm`, prototype)
+
+`dockerd` runs in a small Alpine VM that QEMU boots *inside* the ccd container. The container
+stays unprivileged; the only extra it gets is `--device /dev/kvm` when the host has it. A
+`--privileged` container started by the tests is root in the *VM*, not on your machine: the
+guest kernel is the boundary (comparable to Kata Containers, but nothing has to be installed
+on the host).
+
+```
+host
+ └─ ccd container (unprivileged, + /dev/kvm)
+     ├─ claude                      DOCKER_HOST=tcp://127.0.0.1:2375
+     └─ qemu microVM  (own kernel)
+         └─ dockerd  ← testcontainers / compose run here
+```
+
+| | |
+| --- | --- |
+| Speed | with KVM (Linux) the VM boots in seconds and runs at near-native speed. Without `/dev/kvm` (macOS, Windows, or a host VM without nested virtualisation) QEMU falls back to emulation: it works, but it is slow. |
+| Images | the VM's Docker data disk is a sparse file in the `claude-vm-data` volume; images survive the session. The VM's root disk is reset every session. |
+| Ports | the VM's dynamic port range (`30000-30199`, override with `CCD_VM_PORTS`) is forwarded to `127.0.0.1` in the container, so testcontainers works via `localhost` without configuration (the entrypoint sets `TESTCONTAINERS_CONNECTION_MODE=docker_host` and `TESTCONTAINERS_HOST_OVERRIDE=localhost`, unless you set them yourself — testcontainers-python would otherwise guess "DinD" and dial the gateway IP). Fixed ports (`-p 8080:80`, compose) need `CCD_VM_FORWARD=8080,5432`. |
+| Bind mounts | `/workdir` is shared into the VM (9p) at the same path, so `-v /workdir/...:/x` works. Other paths (`~/.m2`, `--mount` directories) are not visible in the VM — copy files in instead. |
+| Shutdown | when Claude exits, the VM is powered off cleanly via the QEMU guest agent. A hard stop (`docker kill` of the ccd container) can corrupt the image store; `ccd` then reports the daemon crash and you start over with `docker volume rm claude-vm-data`. |
+
+Tuning (environment variables, passed on by `ccd`): `CCD_VM_CPUS` (default: all),
+`CCD_VM_MEMORY` (default `2G`), `CCD_VM_DISK` (data disk size on first creation, default
+`64G`, sparse), `CCD_VM_PORTS`, `CCD_VM_FORWARD`, `CCD_VM_TIMEOUT` (boot timeout in seconds).
+
+Caveats of the prototype: a forwarded port accepts the connection even when nothing listens
+in the VM yet (QEMU user networking answers on the VM's behalf and then closes it), so a
+"is the port open" check passes early — testcontainers' wait strategies also look inside the
+container, so they are not fooled. The Docker API inside the VM is plain TCP; it is only
+reachable from the ccd container and from inside the VM itself. That is also why `--dind=vm`
+refuses `--host-net`: there, the container's localhost is the host's.
 
 Is that volume filling up? Clean it up with:
 

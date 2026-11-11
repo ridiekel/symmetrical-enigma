@@ -67,6 +67,219 @@ if [ -d "$SSH_DIR" ]; then
   fi
 fi
 
+# Give 'claude' access to a device/socket that belongs to a host group (docker.sock,
+# /dev/kvm). We look up the gid of the node and put 'claude' in a group with that gid (the gid
+# on the host rarely matches an existing group in the container).
+grant_group_access() {
+  local node="$1" gid grp
+  gid="$(stat -c %g "$node" 2>/dev/null || echo 0)"
+  if [ "$gid" != "0" ]; then
+    # getent exits non-zero when the gid has no name; under 'set -euo pipefail' that would
+    # silently kill the entrypoint before 'exec claude'. '|| true' catches that, so grp
+    # simply stays empty and we create the group below.
+    grp="$(getent group "$gid" | cut -d: -f1 || true)"
+    if [ -z "$grp" ]; then
+      grp="host-$(basename "$node" | tr -c 'a-z0-9\n' '-')"
+      groupadd -o -g "$gid" "$grp"
+    fi
+    usermod -aG "$grp" "$USER_NAME"
+  else
+    # gid 0 / undeterminable (e.g. Docker Desktop): make the node directly accessible. This
+    # only changes the container's own copy of the node, not the one on the host.
+    chmod 666 "$node" || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# VM mode (ccd --dind=vm): dockerd in a QEMU microVM
+# ---------------------------------------------------------------------------
+# The guest (kernel, initramfs, root disk) comes from the 'ccd-vm' stage in the Dockerfile.
+# QEMU runs as 'claude' in this unprivileged container; with /dev/kvm passed in it uses
+# hardware virtualisation, otherwise it falls back to (slow) TCG emulation.
+#
+#   root disk  /opt/ccd-vm/root.qcow2, opened with snapshot=on -> clean root every session
+#   data disk  /var/lib/ccd-vm/docker.img (volume claude-vm-data) -> /var/lib/docker
+#   /workdir   shared over 9p at the same path, so bind mounts of /workdir/... work
+#   network    QEMU user networking (no NET_ADMIN needed). The Docker API (2375) and the
+#              port range the guest hands out for published ports are forwarded to
+#              127.0.0.1 here, so testcontainers can reach its containers via localhost.
+VM_IMG=/opt/ccd-vm
+VM_STATE=/var/lib/ccd-vm
+VM_RUN=/run/ccd-vm
+VM_PID=""
+
+# Send one line to a QEMU unix socket: the HMP monitor ('hmp', which greets us with a banner
+# first) or the guest agent ('qga', JSON, no banner and no reply to guest-shutdown).
+vm_send() {
+  python3 - "$1" "$2" "$3" <<'PY' >/dev/null 2>&1 || true
+import socket, sys, time
+kind, path, line = sys.argv[1:4]
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(5)
+s.connect(path)
+if kind == "hmp":
+    s.recv(4096)
+s.sendall((line + "\n").encode())
+time.sleep(0.3)
+PY
+}
+
+# Is the QEMU process still running? Not just 'kill -0': QEMU daemonizes, and a PID 1 that
+# doesn't reap adopted children leaves it behind as a zombie, which 'kill -0' still sees.
+vm_alive() {
+  local st
+  st="$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f1)"
+  [ -n "$st" ] && [ "$st" != Z ]
+}
+
+# Ask the guest agent for a clean poweroff (the data disk gets unmounted properly). Hard
+# stop only when the guest doesn't manage that in time.
+vm_shutdown() {
+  [ -n "$VM_PID" ] || return 0
+  local pid="$VM_PID"
+  VM_PID=""
+  vm_alive "$pid" || return 0
+  vm_send qga "$VM_RUN/qga.sock" '{"execute":"guest-shutdown","arguments":{"mode":"powerdown"}}'
+  for _ in $(seq 1 "${CCD_VM_SHUTDOWN_TIMEOUT:-30}"); do
+    vm_alive "$pid" || return 0
+    sleep 1
+  done
+  echo "The VM did not power off in time; stopping it hard." >&2
+  vm_send hmp "$VM_RUN/monitor.sock" quit
+  sleep 1
+  kill -9 "$pid" 2>/dev/null || true
+}
+
+vm_start() {
+  local uid gid accel cpu machine qemu console disk ports lo hi fwd extra p cpus mem append timeout
+
+  uid="$(id -u "$USER_NAME")"
+  gid="$(id -g "$USER_NAME")"
+  mkdir -p "$VM_RUN" "$VM_STATE"
+  chown "$uid:$gid" "$VM_RUN" "$VM_STATE"
+
+  if [ -c /dev/kvm ]; then
+    grant_group_access /dev/kvm
+    accel=kvm
+    cpu=host
+  else
+    accel=tcg
+    cpu=max
+    echo "Warning: no /dev/kvm — the VM runs under emulation (TCG) and will be slow." >&2
+  fi
+
+  case "$(uname -m)" in
+    x86_64)  qemu=qemu-system-x86_64;  machine="q35,accel=$accel"; console=ttyS0 ;;
+    aarch64) qemu=qemu-system-aarch64; machine="virt,accel=$accel"; console=ttyAMA0 ;;
+    *) echo "--dind=vm: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+  esac
+
+  # Docker data disk: a sparse raw file in the volume, created and formatted once.
+  disk="$VM_STATE/docker.img"
+  if [ ! -f "$disk" ]; then
+    echo "Creating the VM's Docker disk (${CCD_VM_DISK:-64G}, sparse)..."
+    truncate -s "${CCD_VM_DISK:-64G}" "$disk"
+    mkfs.ext4 -q -F -L ccd-vm-docker "$disk"
+  fi
+  chown "$uid:$gid" "$disk"
+
+  # Published ports. The guest kernel's ephemeral range (which dockerd uses for '-p PORT'
+  # without a host port, i.e. everything testcontainers publishes) is pinned to this range,
+  # and the whole range is forwarded up front — no watcher, no race with the first connect.
+  ports="${CCD_VM_PORTS:-30000-30199}"
+  lo="${ports%-*}"
+  hi="${ports#*-}"
+  case "$lo$hi" in
+    ''|*[!0-9]*) echo "CCD_VM_PORTS must look like 30000-30199 (got '$ports')." >&2; exit 1 ;;
+  esac
+  if [ "$lo" -gt "$hi" ]; then
+    echo "CCD_VM_PORTS: '$ports' is not a valid range." >&2
+    exit 1
+  fi
+  fwd="hostfwd=tcp:127.0.0.1:2375-:2375"
+  for p in $(seq "$lo" "$hi"); do fwd="$fwd,hostfwd=tcp:127.0.0.1:$p-:$p"; done
+  # Fixed ports ('-p 8080:80', docker compose) are not in that range: list them in
+  # CCD_VM_FORWARD (comma-separated) to forward them as well.
+  extra="${CCD_VM_FORWARD:-}"
+  for p in ${extra//,/ }; do
+    case "$p" in ''|*[!0-9]*) echo "CCD_VM_FORWARD: '$p' is not a port." >&2; exit 1 ;; esac
+    if [ "$p" -ge "$lo" ] && [ "$p" -le "$hi" ]; then continue; fi
+    [ "$p" = 2375 ] && continue
+    fwd="$fwd,hostfwd=tcp:127.0.0.1:$p-:$p"
+  done
+
+  cpus="${CCD_VM_CPUS:-$(nproc)}"
+  mem="${CCD_VM_MEMORY:-2G}"
+  append="root=/dev/vda rootfstype=ext4 modules=ext4,virtio_blk console=$console quiet"
+  append="$append sysctl.net.ipv4.ip_local_port_range=\"$lo $hi\""
+
+  echo "Starting the Docker VM ($accel, $cpus CPUs, $mem)..."
+  rm -f "$VM_RUN/console.log" "$VM_RUN/monitor.sock" "$VM_RUN/qga.sock" "$VM_RUN/qemu.pid"
+  if ! gosu "$USER_NAME" "$qemu" \
+      -name ccd-vm \
+      -machine "$machine" -cpu "$cpu" -smp "$cpus" -m "$mem" \
+      -nodefaults -no-user-config -display none \
+      -kernel "$VM_IMG/vmlinuz-virt" -initrd "$VM_IMG/initramfs-virt" -append "$append" \
+      -drive "if=none,id=root,file=$VM_IMG/root.qcow2,format=qcow2,snapshot=on" \
+      -device virtio-blk-pci,drive=root \
+      -drive "if=none,id=data,file=$disk,format=raw,discard=unmap" \
+      -device virtio-blk-pci,drive=data \
+      -netdev "user,id=net0,$fwd" \
+      -device virtio-net-pci,netdev=net0,romfile= \
+      -fsdev local,id=workdir,path=/workdir,security_model=none \
+      -device virtio-9p-pci,fsdev=workdir,mount_tag=workdir \
+      -device virtio-rng-pci \
+      -device virtio-serial-pci \
+      -chardev "socket,id=qga,path=$VM_RUN/qga.sock,server=on,wait=off" \
+      -device virtserialport,chardev=qga,name=org.qemu.guest_agent.0 \
+      -serial "file:$VM_RUN/console.log" \
+      -monitor "unix:$VM_RUN/monitor.sock,server,nowait" \
+      -pidfile "$VM_RUN/qemu.pid" -daemonize; then
+    echo "QEMU failed to start." >&2
+    exit 1
+  fi
+  VM_PID="$(cat "$VM_RUN/qemu.pid")"
+
+  export DOCKER_HOST=tcp://127.0.0.1:2375
+  # Published ports are reachable on localhost (forwarded above). testcontainers-python
+  # otherwise sees "inside a container + Docker on localhost", concludes DinD and connects
+  # to the gateway IP instead, which gets 'connection refused' (Ryuk fails first).
+  export TESTCONTAINERS_CONNECTION_MODE="${TESTCONTAINERS_CONNECTION_MODE:-docker_host}"
+  export TESTCONTAINERS_HOST_OVERRIDE="${TESTCONTAINERS_HOST_OVERRIDE:-localhost}"
+  if [ "$accel" = kvm ]; then timeout="${CCD_VM_TIMEOUT:-120}"; else timeout="${CCD_VM_TIMEOUT:-900}"; fi
+  for _ in $(seq 1 "$timeout"); do
+    if ! vm_alive "$VM_PID"; then
+      echo "The VM stopped during boot. Last console lines:" >&2
+      tail -n 30 "$VM_RUN/console.log" >&2 || true
+      exit 1
+    fi
+    # The guest mirrors dockerd's log to the console. A crash there would otherwise only
+    # show as a timeout (supervise-daemon keeps restarting it).
+    if grep -q -E '^panic:|level=fatal|failed to start daemon' "$VM_RUN/console.log" 2>/dev/null; then
+      echo "dockerd in the VM failed to start. Console:" >&2
+      grep -E -A 12 '^panic:|level=fatal|failed to start daemon' "$VM_RUN/console.log" | head -n 30 >&2 || true
+      echo >&2
+      echo "If this is a corrupt image store (e.g. after a hard stop), start over with" >&2
+      echo "  docker volume rm claude-vm-data      (on the host; removes the VM's images)" >&2
+      vm_shutdown
+      exit 1
+    fi
+    if docker info >/dev/null 2>&1; then
+      echo "Docker VM is up (DOCKER_HOST=$DOCKER_HOST, published ports $lo-$hi)."
+      return 0
+    fi
+    sleep 1
+  done
+  echo "The Docker VM did not come up within ${timeout}s. Last console lines:" >&2
+  tail -n 30 "$VM_RUN/console.log" >&2 || true
+  vm_shutdown
+  exit 1
+}
+
+if [ "${CCD_DOCKER_MODE:-}" = "vm" ]; then
+  vm_start
+fi
+
 # DinD mode: start our own Docker daemon *in* the container (separate from the host Docker).
 # 'ccd' then runs the container with --privileged and sets CCD_DOCKER_MODE=dind.
 if [ "${CCD_DOCKER_MODE:-}" = "dind" ]; then
@@ -89,15 +302,16 @@ if [ "${CCD_DOCKER_MODE:-}" = "dind" ]; then
     exit 1
   fi
   echo "Internal Docker daemon is up."
+fi
 
-  # --prune: clean up the whole DinD store (all images, stopped containers, build cache,
-  # unused volumes) and exit — no Claude session is started.
-  if [ "${CCD_PRUNE:-}" = "1" ]; then
-    echo "Cleaning up the DinD store..."
-    docker system prune -a -f --volumes
-    echo "Done."
-    exit 0
-  fi
+# --prune (DinD or VM): clean up the whole image store (all images, stopped containers,
+# build cache, unused volumes) and exit — no Claude session is started.
+if [ "${CCD_PRUNE:-}" = "1" ] && [ -n "${CCD_DOCKER_MODE:-}" ]; then
+  echo "Cleaning up the ${CCD_DOCKER_MODE} image store..."
+  docker system prune -a -f --volumes
+  vm_shutdown
+  echo "Done."
+  exit 0
 fi
 
 # DooD over TCP (ccd --docker with DOCKER_HOST=tcp://...): 'ccd' passes the client TLS certs
@@ -119,25 +333,10 @@ if [ -n "${CCD_DOCKER_TLS_CA:-}${CCD_DOCKER_TLS_CERT:-}${CCD_DOCKER_TLS_KEY:-}" 
 fi
 
 # Docker socket access: if the host socket is mounted (ccd --docker), make sure 'claude'
-# can reach it. We look up the gid of the socket and put 'claude' in a group with that gid
-# (the gid on the host rarely matches an existing group in the container).
+# can reach it.
 DOCKER_SOCK=/var/run/docker.sock
 if [ -S "$DOCKER_SOCK" ]; then
-  SOCK_GID="$(stat -c %g "$DOCKER_SOCK" 2>/dev/null || echo 0)"
-  if [ "$SOCK_GID" != "0" ]; then
-    # getent exits non-zero when the gid has no name; under 'set -euo pipefail' that would
-    # silently kill the entrypoint before 'exec claude'. '|| true' catches that, so GRP
-    # simply stays empty and we create the group below.
-    GRP="$(getent group "$SOCK_GID" | cut -d: -f1 || true)"
-    if [ -z "$GRP" ]; then
-      groupadd -o -g "$SOCK_GID" docker
-      GRP=docker
-    fi
-    usermod -aG "$GRP" "$USER_NAME"
-  else
-    # gid 0 / undeterminable (e.g. Docker Desktop): make the socket directly accessible.
-    chmod 666 "$DOCKER_SOCK" || true
-  fi
+  grant_group_access "$DOCKER_SOCK"
 fi
 
 # ---------------------------------------------------------------------------
@@ -324,4 +523,23 @@ fi
 
 # Drop privileges to 'claude' and start the agent
 # (login shell so SDKMAN/Java/Maven are on PATH)
-exec gosu "$USER_NAME" bash -lc 'exec "$0" "$@"' "$AGENT_CMD" "$@"
+if [ -z "$VM_PID" ]; then
+  exec gosu "$USER_NAME" bash -lc 'exec "$0" "$@"' "$AGENT_CMD" "$@"
+fi
+
+# VM mode: we can't exec, because the VM has to be shut down cleanly once the agent exits.
+# The agent runs as a background child (with stdin passed through explicitly — a
+# non-interactive shell would give it /dev/null otherwise) in the same, foreground process
+# group, so the TTY behaves exactly as with exec. 'wait' returns early whenever a trapped
+# signal arrives, hence the loop.
+gosu "$USER_NAME" bash -lc 'exec "$0" "$@"' "$AGENT_CMD" "$@" <&0 &
+CHILD=$!
+trap 'kill -TERM "$CHILD" 2>/dev/null || true' TERM HUP
+trap ':' INT   # Ctrl+C is the agent's to handle; we just mustn't die from it
+rc=0
+while :; do
+  wait "$CHILD" && rc=0 || rc=$?
+  kill -0 "$CHILD" 2>/dev/null || break
+done
+vm_shutdown
+exit "$rc"
