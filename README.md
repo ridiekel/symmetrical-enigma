@@ -357,6 +357,28 @@ alias ccd-proj='CCD_MOUNTS=$HOME/shared-libs:/libs:ro ccd'
 On Git Bash, write `SRC` in the `/c/Users/...` form — in `C:/Users/...` the `:` after the
 drive letter would be read as the `SRC`/`DST` separator.
 
+### Running ccd inside a container (`CCD_HOST_PATH_MAP`)
+
+`ccd` hands host paths to `docker run -v`, and the Docker *daemon* resolves those on its
+own filesystem. When `ccd` itself runs in a container that talks to the daemon of its host
+or VM (a workstation container with the socket mounted), a path that exists only in that
+container arrives as an empty directory. `ccd` notices and refuses to start: the config
+directory must carry this run's token, and a working directory with content must not show
+up empty.
+
+Two things make it work. Everything `ccd` mounts must be a directory the daemon sees too
+— the project, the config directory (`CCD_CONFIG_DIR`) and `~/.m2` (`CCD_M2_DIR`), so mount
+those into the outer container from the daemon's side. And where the same directory has
+another path at the daemon than in your container, say so:
+
+```bash
+# <path here>=<path at the daemon>, several separated by commas; the first match wins
+export CCD_HOST_PATH_MAP=/home/me/Projects=/Users/me/Projects
+```
+
+`ccd` then translates the source of every bind mount (the working directory, the config
+directory, `~/.m2`, `--mount`) with it.
+
 ### SSH / git over SSH
 
 `ccd` mounts a persistent, container-owned SSH directory

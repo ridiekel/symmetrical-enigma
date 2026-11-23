@@ -60,6 +60,25 @@ to_host_path() {
   fi
 }
 
+# Source path of a bind mount, as the Docker *daemon* has to see it. Normally that is
+# just the host path. CCD_HOST_PATH_MAP translates it when ccd itself runs in a container
+# that talks to the daemon of its host or VM, where the same directory lives at another
+# path: "<path here>=<path at the daemon>", several separated by commas. The first
+# prefix that matches wins.
+to_daemon_path() {
+  local p="$1" pair from to IFS=,
+  for pair in ${CCD_HOST_PATH_MAP:-}; do
+    from="${pair%%=*}"; to="${pair#*=}"
+    if [ -z "$from" ] || [ "$from" = "$pair" ]; then continue; fi
+    from="${from%/}"; to="${to%/}"
+    case "$p" in
+      "$from")   p="$to"; break ;;
+      "$from"/*) p="$to${p#"$from"}"; break ;;
+    esac
+  done
+  to_host_path "$p"
+}
+
 # Path for this shell: /c/Users/... on Windows, unchanged elsewhere.
 to_unix_path() {
   if [ "$IS_WINDOWS" = "1" ] && command -v cygpath >/dev/null 2>&1; then
@@ -1034,7 +1053,7 @@ clip_bridge_start() {
   CLIP_PID=$!
   trap clip_bridge_stop EXIT INT TERM
 
-  RUN_FLAGS+=(-v "$(to_host_path "$CLIP_DIR")":"$CLIP_MOUNT")
+  RUN_FLAGS+=(-v "$(to_daemon_path "$CLIP_DIR")":"$CLIP_MOUNT")
   RUN_FLAGS+=(-e CCD_CLIP_BRIDGE="$CLIP_MOUNT")
   # Tells the entrypoint to point $BROWSER at the bridge shim.
   [ "$URL_BACKEND" != "none" ] && RUN_FLAGS+=(-e CCD_BROWSER_BRIDGE=1)
@@ -1056,7 +1075,7 @@ if [ "$NO_M2" != "1" ] && [ -z "${CCD_NO_M2:-}" ]; then
   # source as root, leaving a directory the host user can't write to.
   mkdir -p "$M2_DIR" 2>/dev/null || true
   if [ -d "$M2_DIR" ]; then
-    RUN_FLAGS+=(-v "$(to_host_path "$M2_DIR")":/home/claude/.m2)
+    RUN_FLAGS+=(-v "$(to_daemon_path "$M2_DIR")":/home/claude/.m2)
   else
     echo "Warning: '$M2_DIR' does not exist and could not be created — Maven runs" >&2
     echo "with an empty repository in the container." >&2
@@ -1093,7 +1112,7 @@ add_extra_mount() {
     *)  echo "--mount: container path '$dst' must be absolute." >&2
         exit 1 ;;
   esac
-  RUN_FLAGS+=(-v "$(to_host_path "$src")":"$dst$ro")
+  RUN_FLAGS+=(-v "$(to_daemon_path "$src")":"$dst$ro")
 }
 
 # CCD_MOUNTS first (the environment is the "default"), then the --mount flags, so a flag
@@ -1131,7 +1150,12 @@ fi
 # token in the config dir; the entrypoint refuses to start if it doesn't see it.
 MOUNT_TOKEN="$(date +%s)-$$-$RANDOM"
 printf '%s\n' "$MOUNT_TOKEN" > "$CONFIG_DIR/.ccd-mount-check"
-RUN_FLAGS+=(-e CCD_MOUNT_TOKEN="$MOUNT_TOKEN" -e CCD_HOST_CONFIG_DIR="$CONFIG_DIR")
+RUN_FLAGS+=(-e CCD_MOUNT_TOKEN="$MOUNT_TOKEN" -e CCD_HOST_CONFIG_DIR="$(to_daemon_path "$CONFIG_DIR")")
+# The same for the working directory, where we can't drop a token: if it has content here,
+# it must not arrive empty.
+if [ -n "$(ls -A "$MOUNT_SRC" 2>/dev/null)" ]; then
+  RUN_FLAGS+=(-e CCD_HOST_WORKDIR="$(to_daemon_path "$MOUNT_SRC")")
+fi
 # Which daemon that is: DOCKER_HOST wins, otherwise the active docker context decides — a
 # context can point at another machine just as well, with DOCKER_HOST unset.
 if [ -n "${DOCKER_HOST:-}" ]; then
@@ -1145,10 +1169,10 @@ RUN_FLAGS+=(-e CCD_DOCKER_HOST_HINT="$DAEMON_HINT")
 
 rc=0
 "${NOCONV[@]}" "${DOCKER_RUN[@]}" run "${RUN_FLAGS[@]}" \
-  -v "$(to_host_path "$MOUNT_SRC")":/workdir \
-  -v "$(to_host_path "$CONFIG_DIR")":/home/claude/.claude \
-  -v "$(to_host_path "$SSH_DIR")":/home/claude/.ssh \
-  -v "$(to_host_path "$VIBE_DIR")":/home/claude/.vibe \
+  -v "$(to_daemon_path "$MOUNT_SRC")":/workdir \
+  -v "$(to_daemon_path "$CONFIG_DIR")":/home/claude/.claude \
+  -v "$(to_daemon_path "$SSH_DIR")":/home/claude/.ssh \
+  -v "$(to_daemon_path "$VIBE_DIR")":/home/claude/.vibe \
   -w "$WORKDIR_IN" \
   "$IMAGE" "$@" || rc=$?
 

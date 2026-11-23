@@ -71,6 +71,24 @@ EOF
   fi
 fi
 
+# The working directory, same story: 'ccd' sets CCD_HOST_WORKDIR only when the directory
+# has content on its side, so an empty /workdir means the daemon looked somewhere else.
+if [ -n "${CCD_HOST_WORKDIR:-}" ] && [ -z "$(ls -A /workdir 2>/dev/null)" ]; then
+  cat >&2 <<EOF
+ccd: the working directory did not arrive in the container.
+  host path : $CCD_HOST_WORKDIR
+  daemon    : ${CCD_DOCKER_HOST_HINT:-the local socket}
+
+It has content where ccd was started, but the Docker daemon mounted an empty directory:
+it resolves that path on *its own* filesystem and doesn't find it there.
+
+Fix: start ccd from a path the daemon sees at the same location. When ccd runs inside a
+container and the daemon knows the directory under another path, translate it:
+  CCD_HOST_PATH_MAP=<path here>=<path at the daemon>
+EOF
+  exit 78
+fi
+
 # Optional: map the container user to the host uid/gid so that bind mounts (Linux)
 # get the right owner. 'ccd' only sets these on Linux; empty => keep the image uid.
 TARGET_UID="${HOST_UID:-}"
