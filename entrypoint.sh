@@ -105,7 +105,7 @@ if [ -d "$SSH_DIR" ]; then
   # Not fatal: on a shared folder of a VM the chown can be refused, and ssh then tells
   # what it thinks of the owner itself.
   chown -R "$(id -u "$USER_NAME"):$(id -g "$USER_NAME")" "$SSH_DIR" || true
-  chmod 700 "$SSH_DIR"
+  chmod 700 "$SSH_DIR" || true
   find "$SSH_DIR" -type f -exec chmod 600 {} + 2>/dev/null || true
 
   if ! ls "$SSH_DIR"/id_* >/dev/null 2>&1; then

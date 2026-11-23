@@ -337,18 +337,30 @@ mkdir -p "$STATE_DIR"
 CONFIG_DIR="${CCD_CONFIG_DIR:-$STATE_DIR}"
 mkdir -p "$CONFIG_DIR"
 
+# A directory for secrets: create it and close it to others. The chmod may be refused
+# when the config dir is a folder shared by a VM and seen from a container (Colima's
+# share, as another uid): that must not stop ccd, the share decides the permissions
+# there. Only say something when the directory is in fact open to others.
+private_dir() {
+  mkdir -p "$1"
+  if ! chmod 700 "$1" 2>/dev/null; then
+    case "$(ls -ld "$1" 2>/dev/null)" in
+      drwx------*) ;;
+      *) echo "Warning: could not restrict '$1' to its owner (chmod 700 was refused)." >&2 ;;
+    esac
+  fi
+}
+
 # Persistent, container-owned SSH directory (separate from the host ~/.ssh). It keeps an
 # own SSH key *and* known_hosts across --rm runs, so git-over-ssh keeps working.
 SSH_DIR="$CONFIG_DIR/ssh"
-mkdir -p "$SSH_DIR"
-chmod 700 "$SSH_DIR"
+private_dir "$SSH_DIR"
 
 # Mistral Vibe's home (~/.vibe: config.toml, the API key in .env, trusted folders, session
 # logs), kept per profile next to the SSH directory. Mounted for both agents, so a Claude
 # session can read or edit the Vibe config too. 700: .env holds the API key.
 VIBE_DIR="$CONFIG_DIR/vibe"
-mkdir -p "$VIBE_DIR"
-chmod 700 "$VIBE_DIR"
+private_dir "$VIBE_DIR"
 
 docker_running() {
   docker info >/dev/null 2>&1
