@@ -8,22 +8,66 @@ USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
 # token is missing, the daemon resolved our bind-mount paths on a different filesystem and
 # handed us empty directories — stop before generating keys or logging in into nowhere.
 if [ -n "${CCD_MOUNT_TOKEN:-}" ]; then
-  seen="$(cat "$USER_HOME/.claude/.ccd-mount-check" 2>/dev/null || true)"
+  check_dir="$USER_HOME/.claude"
+  check_file="$check_dir/.ccd-mount-check"
+  seen="$(cat "$check_file" 2>/dev/null || true)"
   if [ "$seen" != "$CCD_MOUNT_TOKEN" ]; then
-    cat >&2 <<EOF
+    {
+      cat <<EOF
 ccd: the config directory did not arrive in the container.
   host path : ${CCD_HOST_CONFIG_DIR:-?}
-  expected  : $USER_HOME/.claude/.ccd-mount-check with this run's token
+  expected  : $check_file with this run's token
+  daemon    : ${CCD_DOCKER_HOST_HINT:-the local socket}
 
-Bind mounts are resolved by the Docker daemon on *its own* filesystem. This daemon
-(${CCD_DOCKER_HOST_HINT:-the local socket}) does not see that path, so it
-created empty directories instead — login, SSH key and /workdir would all be wrong.
-
-Fix: make that path available to the daemon at the *same* location. For a dind sidecar
-in docker compose: mount the volume that holds it into the dind service as well, at the
-same path as in your own container (e.g. '- <home-volume>:/home/<you>').
 EOF
-    exit 1
+      # Four different failures end up here; tell them apart, their fixes have nothing in common.
+      if ! ls -A "$check_dir" >/dev/null 2>&1 || { [ -e "$check_file" ] && [ ! -r "$check_file" ]; }; then
+        cat <<EOF
+The directory is mounted, but it cannot be read from inside the container (permission
+denied, even as root). The daemon sees the path; something blocks access to it:
+  * SELinux (Fedora/RHEL): the content needs a container label, e.g.
+      chcon -Rt container_file_t '${CCD_HOST_CONFIG_DIR:-<config dir>}'
+  * userns-remap or a network home (NFS root_squash): container root is not root on
+    that filesystem. Put the config dir elsewhere with CCD_CONFIG_DIR=<path>.
+EOF
+      elif [ -n "$seen" ]; then
+        cat <<EOF
+The directory did arrive, but its token belongs to another run (found '$seen',
+expected '$CCD_MOUNT_TOKEN'). Most likely a second 'ccd' started at the same moment
+with the same config dir and overwrote the token — just start this one again.
+If it keeps happening, the daemon sees a stale *copy* of that path, not the directory
+ccd writes to.
+EOF
+      elif [ -n "$(ls -A "$check_dir" 2>/dev/null)" ]; then
+        cat <<EOF
+The daemon mounted a directory at that path, but not the one ccd just wrote to: it has
+content, yet no token. The daemon resolves the path on a different filesystem that
+holds its own (older) copy.
+EOF
+      else
+        cat <<EOF
+Bind mounts are resolved by the Docker daemon on *its own* filesystem. This daemon does
+not see that path, so it created empty directories instead — login, SSH key and /workdir
+would all be wrong.
+
+Fix: make that path available to the daemon at the *same* location.
+  * dind sidecar in docker compose: mount the volume that holds it into the dind service
+    as well, at the same path as in your own container (e.g. '- <home-volume>:/home/<you>').
+  * ccd started *inside* a container that uses the socket of its host or VM: the path
+    exists in that container only. Mount the directory from the daemon's side into
+    that container at the same path and point CCD_CONFIG_DIR (and CCD_M2_DIR) at it;
+    start ccd from a project path that is shared the same way.
+  * Docker Desktop (on Linux too, it runs in a VM): add the path under
+    Settings > Resources > File sharing.
+  * Docker installed as a snap: it is confined and cannot see every host path. Try
+    CCD_CONFIG_DIR=\$HOME/claude-docker, or install Docker from docker.com instead.
+  * a docker context or DOCKER_HOST pointing at another machine: switch back
+    ('docker context use default') or use a path that exists there.
+EOF
+      fi
+    } >&2
+    # 78 (EX_CONFIG) tells 'ccd' to add what it knows about the daemon.
+    exit 78
   fi
 fi
 

@@ -1120,12 +1120,40 @@ fi
 MOUNT_TOKEN="$(date +%s)-$$-$RANDOM"
 printf '%s\n' "$MOUNT_TOKEN" > "$CONFIG_DIR/.ccd-mount-check"
 RUN_FLAGS+=(-e CCD_MOUNT_TOKEN="$MOUNT_TOKEN" -e CCD_HOST_CONFIG_DIR="$CONFIG_DIR")
-RUN_FLAGS+=(-e CCD_DOCKER_HOST_HINT="${DOCKER_HOST:-local socket}")
+# Which daemon that is: DOCKER_HOST wins, otherwise the active docker context decides — a
+# context can point at another machine just as well, with DOCKER_HOST unset.
+if [ -n "${DOCKER_HOST:-}" ]; then
+  DAEMON_HINT="DOCKER_HOST=$DOCKER_HOST"
+else
+  DAEMON_CTX="$(docker context show 2>/dev/null || true)"
+  DAEMON_ENDPOINT="$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)"
+  DAEMON_HINT="${DAEMON_ENDPOINT:-local socket} (docker context '${DAEMON_CTX:-default}')"
+fi
+RUN_FLAGS+=(-e CCD_DOCKER_HOST_HINT="$DAEMON_HINT")
 
+rc=0
 "${NOCONV[@]}" "${DOCKER_RUN[@]}" run "${RUN_FLAGS[@]}" \
   -v "$(to_host_path "$MOUNT_SRC")":/workdir \
   -v "$(to_host_path "$CONFIG_DIR")":/home/claude/.claude \
   -v "$(to_host_path "$SSH_DIR")":/home/claude/.ssh \
   -v "$(to_host_path "$VIBE_DIR")":/home/claude/.vibe \
   -w "$WORKDIR_IN" \
-  "$IMAGE" "$@"
+  "$IMAGE" "$@" || rc=$?
+
+# 78: the entrypoint's mount check failed (see above). Add what only this side can know
+# about the daemon — it usually names the culprit (Docker Desktop's VM, a snap, a remote).
+if [ "$rc" = "78" ]; then
+  {
+    echo
+    echo "The daemon ccd talked to:"
+    docker info --format '  name      : {{.Name}}
+  os        : {{.OperatingSystem}}
+  data root : {{.DockerRootDir}}
+  security  : {{join .SecurityOptions ", "}}' 2>/dev/null || echo "  (docker info failed)"
+    case "$(docker info --format '{{.OperatingSystem}}|{{.DockerRootDir}}' 2>/dev/null || true)" in
+      *"Docker Desktop"*) echo "  -> Docker Desktop: the daemon runs in a VM; check Settings > Resources > File sharing." ;;
+      *"/snap/"*)         echo "  -> Docker from a snap: it is confined and cannot see every host path." ;;
+    esac
+  } >&2
+fi
+exit "$rc"
