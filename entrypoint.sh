@@ -82,22 +82,29 @@ fi
 
 if [ -n "$TARGET_UID" ] && [ "$TARGET_UID" != "$(id -u "$USER_NAME")" ]; then
   usermod -o -u "$TARGET_UID" "$USER_NAME"
-  # Home (incl. ~/.sdkman, …) back to the new owner. A bind-mounted ~/.m2 is skipped:
-  # those files already belong to the host user, and a Maven repository is big enough
-  # that a recursive chown on every start would be noticeable.
-  if grep -q " $USER_HOME/.m2 " /proc/mounts 2>/dev/null; then
-    find "$USER_HOME" -path "$USER_HOME/.m2" -prune -o \
-      -exec chown -h "$TARGET_UID:${TARGET_GID:-$TARGET_UID}" {} +
-  else
-    chown -R "$TARGET_UID:${TARGET_GID:-$TARGET_UID}" "$USER_HOME"
-  fi
+  # Home (incl. ~/.sdkman, …) back to the new owner — but not what is bind-mounted into
+  # it (~/.claude, ~/.ssh, ~/.vibe, ~/.m2): those files already belong to the host user,
+  # a Maven repository is big enough that a recursive chown on every start would be
+  # noticeable, and a shared folder of a VM (Colima, Docker Desktop) may refuse the
+  # chown outright ("Operation not permitted" on the root of the share), which used to
+  # abort the start.
+  prune=()
+  while read -r _ mnt _; do
+    case "$mnt" in
+      "$USER_HOME"/*) prune+=(-o -path "$mnt") ;;
+    esac
+  done < /proc/mounts
+  find "$USER_HOME" \( -false "${prune[@]+"${prune[@]}"}" \) -prune -o \
+    -exec chown -h "$TARGET_UID:${TARGET_GID:-$TARGET_UID}" {} +
 fi
 
 # Persistent SSH directory (mounted at ~/.ssh by 'ccd'). Set the right owner/permissions
 # so SSH accepts the key/known_hosts, and generate a container-owned key once.
 SSH_DIR="$USER_HOME/.ssh"
 if [ -d "$SSH_DIR" ]; then
-  chown -R "$(id -u "$USER_NAME"):$(id -g "$USER_NAME")" "$SSH_DIR"
+  # Not fatal: on a shared folder of a VM the chown can be refused, and ssh then tells
+  # what it thinks of the owner itself.
+  chown -R "$(id -u "$USER_NAME"):$(id -g "$USER_NAME")" "$SSH_DIR" || true
   chmod 700 "$SSH_DIR"
   find "$SSH_DIR" -type f -exec chmod 600 {} + 2>/dev/null || true
 
