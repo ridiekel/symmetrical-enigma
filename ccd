@@ -556,11 +556,25 @@ RUN_FLAGS+=(-e CCD_AGENT="$CCD_AGENT")
 # doesn't shadow the key Vibe saved in ~/.vibe/.env (env takes precedence over that file).
 [ -n "${MISTRAL_API_KEY:-}" ] && RUN_FLAGS+=(-e MISTRAL_API_KEY)
 
-# Forward the GitHub token so 'gh' (api/pr/...) is authenticated right away. In a
-# --rm container there is no 'gh auth login' state, so without a token every gh call fails.
-# Forward both names: gh accepts GH_TOKEN *and* GITHUB_TOKEN; only when they are set.
-[ -n "${GH_TOKEN:-}" ] && RUN_FLAGS+=(-e GH_TOKEN)
-[ -n "${GITHUB_TOKEN:-}" ] && RUN_FLAGS+=(-e GITHUB_TOKEN)
+# Forward every *_TOKEN variable that is set on the host (GH_TOKEN, GITHUB_TOKEN,
+# GITLAB_TOKEN, SONAR_TOKEN, NPM_TOKEN, ...) so gh/glab/sonar/... are authenticated right
+# away: a --rm container keeps no 'gh auth login' state. By name only (-e VAR), so the
+# value never shows up in the docker command line; only when non-empty.
+# Skipped:
+#   CCD_*                 ccd's own variables
+#   ANTHROPIC_*/CLAUDE_*  agent credentials: a stray token here would silently override
+#                         the OAuth login in the mounted ~/.claude (same reason
+#                         ANTHROPIC_API_KEY is the only one forwarded, above)
+# CCD_FORWARD_TOKENS=0 turns this off, leaving only GH_TOKEN/GITHUB_TOKEN.
+if [ "${CCD_FORWARD_TOKENS:-1}" = "0" ]; then
+  TOKEN_VARS="GH_TOKEN GITHUB_TOKEN"
+else
+  TOKEN_VARS="$(compgen -e | grep -E '^[A-Za-z_][A-Za-z0-9_]*_TOKEN$' || true)"
+fi
+for var in $TOKEN_VARS; do
+  case "$var" in CCD_*|ANTHROPIC_*|CLAUDE_*) continue ;; esac
+  if [ -n "${!var:-}" ]; then RUN_FLAGS+=(-e "$var"); fi
+done
 
 # Forward the terminal environment so colors/terminfo are correct in the container.
 for var in TERM COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION; do

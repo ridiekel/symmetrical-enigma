@@ -236,6 +236,21 @@ Two options:
 - **API key**: set `ANTHROPIC_API_KEY` in your environment; `ccd` only forwards it when it is set.
 - **Login**: log in once inside the container — the credentials are kept in `~/.config/claude-docker` for later sessions.
 
+### Tokens for other tools
+
+Every `*_TOKEN` variable that is set (non-empty) on the host is forwarded into the
+container — `GH_TOKEN`, `GITHUB_TOKEN`, `GITLAB_TOKEN`, `SONAR_TOKEN`, `NPM_TOKEN`, … — so
+`gh`, `glab`, scanners and package managers are authenticated without logging in again.
+
+```bash
+export GITLAB_TOKEN=glpat-...
+ccd
+```
+
+Not forwarded: `CCD_*`, and `ANTHROPIC_*`/`CLAUDE_*` tokens (they would override the login
+kept in the config dir; use `ANTHROPIC_API_KEY` for key-based auth). Set
+`CCD_FORWARD_TOKENS=0` to forward only `GH_TOKEN`/`GITHUB_TOKEN`.
+
 ### Persistent config
 
 `ccd` mounts `~/.config/claude-docker` at `/home/claude/.claude` in the container.
