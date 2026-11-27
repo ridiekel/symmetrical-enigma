@@ -417,9 +417,49 @@ fi
 # unconditionally: without a bridge the shim just hands over to the real xclip, which is
 # exactly what you want when someone passes a DISPLAY into the container instead.
 CLIP_BRIDGE="${CCD_CLIP_BRIDGE:-/run/ccd-clipboard}"
+# Set when the round trip below fails; the shims then skip the bridge at once instead of
+# waiting out their timeout on every paste. A file rather than an environment variable, so
+# a 'docker exec' into this container sees it too.
+CLIP_BRIDGE_DOWN=/run/ccd-bridge-down
+rm -f "$CLIP_BRIDGE_DOWN"
 if [ -d "$CLIP_BRIDGE" ]; then
   chown "$(id -u "$USER_NAME"):$(id -g "$USER_NAME")" "$CLIP_BRIDGE" 2>/dev/null || true
   chmod 700 "$CLIP_BRIDGE" 2>/dev/null || true
+fi
+
+# Round trip: that the directory exists says nothing. When the Docker daemon doesn't see
+# the host path (a VM that doesn't share it), it creates an empty directory of its own and
+# mounts that: writable, and nobody on the other side. So ask the poller something, as
+# the user the shims run as. Any answer will do (a ccd from before 'ping' existed answers
+# with rc 1), and it normally arrives within one poll interval of 100 ms.
+if [ -n "${CCD_CLIP_BRIDGE:-}" ] && [ -d "$CLIP_BRIDGE" ]; then
+  clip_ping="$CLIP_BRIDGE/ping-$$"
+  gosu "$USER_NAME" sh -c 'printf "ping\n" > "$1.op" && : > "$1.req"' sh "$clip_ping" 2>/dev/null || true
+  clip_waited=0
+  while [ ! -f "$clip_ping.rc" ] && [ "$clip_waited" -lt $(( ${CCD_CLIP_PING_TIMEOUT:-3} * 20 )) ]; do
+    sleep 0.05
+    clip_waited=$(( clip_waited + 1 ))
+  done
+  if [ ! -f "$clip_ping.rc" ]; then
+    : > "$CLIP_BRIDGE_DOWN"
+    {
+      echo "Warning: the bridge to the host does not work — pasting images and opening URLs"
+      echo "in the host browser are off for this session."
+      echo "  in the container : $CLIP_BRIDGE"
+      echo "  on the host      : ${CCD_HOST_CLIP_DIR:-unknown}"
+      echo "  docker daemon    : ${CCD_DOCKER_HOST_HINT:-unknown}"
+      if [ -e "$CLIP_BRIDGE/.alive" ]; then
+        echo "The host's files are visible here, but its poller did not answer a request written"
+        echo "from the container: most likely it cannot read or remove what this side writes."
+      else
+        echo "The daemon mounted a different directory than the one ccd watches on the host:"
+        echo "that path is not shared with the machine the daemon runs on. Share it (or its"
+        echo "parent), set CCD_BRIDGE_DIR to a directory that is shared, or translate the path"
+        echo "with CCD_HOST_PATH_MAP."
+      fi
+    } >&2
+  fi
+  rm -f "$clip_ping.op" "$clip_ping.req" "$clip_ping.out" "$clip_ping.rc" 2>/dev/null || true
 fi
 
 cat > /usr/local/bin/xclip <<'CCD_XCLIP_SHIM'
@@ -438,7 +478,8 @@ fallback() {
   exit 1
 }
 
-[ -d "$BRIDGE" ] || fallback "$@"
+# No bridge, or one the entrypoint found dead at startup (see the round trip there).
+[ -d "$BRIDGE" ] && [ ! -e /run/ccd-bridge-down ] || fallback "$@"
 
 # Scan the arguments without consuming them, so fallback() can still pass on the original
 # command line untouched.
@@ -518,7 +559,7 @@ case "$url" in
   http://?*|https://?*) ;;
   *) echo "ccd-open-url: only http(s) URLs can be opened on the host: $url" >&2; exit 1 ;;
 esac
-if [ ! -d "$BRIDGE" ]; then
+if [ ! -d "$BRIDGE" ] || [ -e /run/ccd-bridge-down ]; then
   echo "ccd-open-url: no bridge to the host — open this URL yourself: $url" >&2
   exit 1
 fi

@@ -392,7 +392,8 @@ export CCD_HOST_PATH_MAP=/home/me/Projects=/Users/me/Projects
 ```
 
 `ccd` then translates the source of every bind mount (the working directory, the config
-directory, `~/.m2`, `--mount`) with it.
+directory and the [clipboard bridge](#pasting-images-clipboard-bridge) inside it, `~/.m2`,
+`--mount`) with it.
 
 ### SSH / git over SSH
 
@@ -598,7 +599,7 @@ directory; the poller answers it with whatever the host platform actually uses:
 | --- | --- |
 | macOS | `osascript` (`the clipboard as «class PNGf»`) |
 | Linux, X11 | `xclip` — install it on the **host** (`apt install xclip`) |
-| Linux, Wayland | `wl-paste` — install `wl-clipboard` on the **host** |
+| Linux, Wayland | `wl-paste` — install `wl-clipboard` on the **host**; falls back to `xclip` (XWayland) when there is a `DISPLAY` too |
 | Windows (Git Bash) | `powershell.exe` + `System.Windows.Forms.Clipboard` |
 | WSL2 | `powershell.exe` as well — what you copy in a Windows app is on the *Windows* clipboard, which WSLg does not hand to `xclip` |
 
@@ -608,6 +609,15 @@ your host clipboard.
 If no clipboard tool is found, `ccd` says so once at startup and simply carries on — a
 headless or CI run has no clipboard to bridge. Turn the bridge off entirely with
 `ccd --no-clipboard` or `CCD_NO_CLIPBOARD=1`.
+
+The bridge directory lives under the config directory
+(`~/.config/claude-docker/.ccd-bridge/<hostname>-<pid>`), because the Docker daemon has to
+see it: with the daemon in a VM (Colima, Docker Desktop, a dind VM) a path that isn't
+shared into the VM arrives as an empty directory, and nothing ever answers. The config
+directory is known to get through. Put it elsewhere with `CCD_BRIDGE_DIR`. At startup the
+container sends the poller a ping; when no answer comes within 3 seconds
+(`CCD_CLIP_PING_TIMEOUT`) you get a warning that names both paths and the daemon, and the
+bridge is switched off for that session instead of timing out on every paste.
 
 Dragging an image **file** into the terminal is a separate matter: that pastes a *host*
 path, which only resolves in the container when the file sits inside the mounted repo.
@@ -690,7 +700,9 @@ yourself and point `CLAUDE_IMAGE` at it (see
 - **Ctrl+V does nothing with an image on the clipboard** — the host needs a clipboard tool
   the bridge can call. On Linux that is `xclip` (X11) or `wl-clipboard` (Wayland), *on the
   host*, not in the container; `ccd` prints a note at startup when it finds neither. Over a
-  plain SSH session there is no clipboard to read at all. See
+  plain SSH session there is no clipboard to read at all. If `ccd` warned at startup that
+  the bridge does not work, the daemon doesn't see the bridge directory: share it with the
+  daemon's VM or point `CCD_BRIDGE_DIR` at a directory that is shared. See
   [Pasting images](#pasting-images-clipboard-bridge).
 - **Linux: permission problems on mounted directories** — `ccd` passes your host uid/gid
   (`HOST_UID`/`HOST_GID`) and the container remaps itself to them. If you run the image

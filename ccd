@@ -828,14 +828,51 @@ clip_detect_backend() {
       # Windows app lives on the *Windows* clipboard, which only PowerShell can reach.
       if grep -qi microsoft /proc/version 2>/dev/null && clip_find_powershell; then
         CLIP_BACKEND=wsl
-      elif [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-paste >/dev/null 2>&1; then
+      elif clip_find_wayland && command -v wl-paste >/dev/null 2>&1; then
+        # Wayland first, with xclip (XWayland) as the fallback per call when there is a
+        # DISPLAY too: see clip_has_image and friends.
         CLIP_BACKEND=wayland
-      elif [ -n "${DISPLAY:-}" ] && command -v xclip >/dev/null 2>&1; then
+      elif clip_x11_ok; then
         CLIP_BACKEND=x11
       fi
       ;;
   esac
   return 0
+}
+
+# A Wayland session to talk to. WAYLAND_DISPLAY is missing in a shell that didn't inherit
+# the session's environment (ssh into your own desktop, tmux started elsewhere, a
+# container with only the socket passed in), so look for the socket itself before giving up.
+clip_find_wayland() {
+  [ -n "${WAYLAND_DISPLAY:-}" ] && return 0
+  local dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" sock
+  for sock in "$dir"/wayland-[0-9]*; do
+    if [ -S "$sock" ]; then
+      export XDG_RUNTIME_DIR="$dir" WAYLAND_DISPLAY="${sock##*/}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+clip_x11_ok() { [ -n "${DISPLAY:-}" ] && command -v xclip >/dev/null 2>&1; }
+
+# The Linux clipboard tools wait for whoever owns the selection, and an owner that never
+# answers would freeze the poller, and with it every later paste and URL. Cap them.
+clip_capped() {
+  if command -v timeout >/dev/null 2>&1; then timeout 5 "$@"; else "$@"; fi
+}
+
+CLIP_IMAGE_RE='image/(png|jpe?g|gif|webp|bmp)'
+clip_x11_has()  { clip_capped xclip -selection clipboard -t TARGETS -o 2>/dev/null | grep -qE "$CLIP_IMAGE_RE"; }
+clip_wl_has()   { clip_capped wl-paste -l 2>/dev/null | grep -qE "$CLIP_IMAGE_RE"; }
+clip_x11_read() {
+  clip_capped xclip -selection clipboard -t image/png -o > "$1" 2>/dev/null && [ -s "$1" ] && return 0
+  clip_capped xclip -selection clipboard -t image/bmp -o > "$1" 2>/dev/null && [ -s "$1" ]
+}
+clip_wl_read() {
+  clip_capped wl-paste -t image/png > "$1" 2>/dev/null && [ -s "$1" ] && return 0
+  clip_capped wl-paste -t image/bmp > "$1" 2>/dev/null && [ -s "$1" ]
 }
 
 # Locate powershell.exe (on PATH under Git Bash and, via the interop, under WSL too).
@@ -871,8 +908,8 @@ clip_win_path() {
 clip_has_image() {
   case "$CLIP_BACKEND" in
     macos)   osascript -e 'the clipboard as «class PNGf»' >/dev/null 2>&1 ;;
-    x11)     xclip -selection clipboard -t TARGETS -o 2>/dev/null | grep -qE 'image/(png|jpe?g|gif|webp|bmp)' ;;
-    wayland) wl-paste -l 2>/dev/null | grep -qE 'image/(png|jpe?g|gif|webp|bmp)' ;;
+    x11)     clip_x11_has ;;
+    wayland) clip_wl_has || { clip_x11_ok && clip_x11_has; } ;;
     windows|wsl)
       clip_ps 'Add-Type -AssemblyName System.Windows.Forms; if (-not [System.Windows.Forms.Clipboard]::ContainsImage()) { exit 1 }' >/dev/null 2>&1 ;;
     *) return 1 ;;
@@ -893,12 +930,8 @@ clip_read_image() {
         -e 'write d to f' \
         -e 'close access f' \
         -e 'end run' "$out" >/dev/null 2>&1 ;;
-    x11)
-      xclip -selection clipboard -t image/png -o > "$out" 2>/dev/null \
-        || xclip -selection clipboard -t image/bmp -o > "$out" 2>/dev/null ;;
-    wayland)
-      wl-paste --type image/png > "$out" 2>/dev/null \
-        || wl-paste --type image/bmp > "$out" 2>/dev/null ;;
+    x11)     clip_x11_read "$out" ;;
+    wayland) clip_wl_read "$out" || { clip_x11_ok && clip_x11_read "$out"; } ;;
     windows|wsl)
       clip_ps 'Add-Type -AssemblyName System.Windows.Forms; $i = [System.Windows.Forms.Clipboard]::GetImage(); if ($null -eq $i) { exit 1 }; $ms = New-Object System.IO.MemoryStream; $i.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); [Convert]::ToBase64String($ms.ToArray())' 2>/dev/null \
         | tr -d '\r' | base64 -d > "$out" 2>/dev/null ;;
@@ -917,7 +950,9 @@ clip_write_image() {
         -e 'set the clipboard to (read (POSIX file (item 1 of argv)) as «class PNGf»)' \
         -e 'end run' "$in" >/dev/null 2>&1 ;;
     x11)     xclip -selection clipboard -t image/png -i < "$in" >/dev/null 2>&1 ;;
-    wayland) wl-copy --type image/png < "$in" >/dev/null 2>&1 ;;
+    wayland)
+      wl-copy --type image/png < "$in" >/dev/null 2>&1 \
+        || { clip_x11_ok && xclip -selection clipboard -t image/png -i < "$in" >/dev/null 2>&1; } ;;
     windows|wsl)
       win="$(clip_win_path "$in")"
       clip_ps "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; \$img = [System.Drawing.Image]::FromFile('${win//\'/\'\'}'); [System.Windows.Forms.Clipboard]::SetImage(\$img); \$img.Dispose()" >/dev/null 2>&1 ;;
@@ -992,10 +1027,17 @@ url_open() {
 # empty <id>.req marker; we answer with <id>.out and finally <id>.rc, which is what the
 # shim waits for. Writing .rc last is the whole synchronisation: it only appears once the
 # payload is complete, so the shim can never read a half-written file.
+#
+# Op 'ping' does nothing but answer: the entrypoint sends one at startup to see whether the
+# directory really is the same one on both sides (see clip_bridge_start).
 clip_bridge_loop() {
   set +e                                  # a failing clipboard call must not kill the loop
-  local marker id op rc
+  local marker id op rc beat=0
   while [ -d "$CLIP_DIR" ]; do
+    # Heartbeat, about every 30 s: how a ccd in another pid namespace can tell this
+    # session is alive (see clip_reap_stale).
+    beat=$(( (beat + 1) % 300 ))
+    [ "$beat" = 1 ] && : > "$CLIP_DIR/.alive" 2>/dev/null
     for marker in "$CLIP_DIR"/*.req; do
       [ -e "$marker" ] || continue
       id="${marker%.req}"
@@ -1006,6 +1048,7 @@ clip_bridge_loop() {
         read)    clip_read_image "$id.out" && rc=0 ;;
         write)   clip_write_image "$id.payload" && rc=0 ;;
         url)     url_open "$id.payload" && rc=0 ;;
+        ping)    rc=0 ;;
       esac
       [ -f "$id.out" ] || : > "$id.out"
       rm -f "$marker"
@@ -1020,6 +1063,34 @@ clip_bridge_loop() {
 clip_bridge_stop() {
   if [ -n "$CLIP_PID" ]; then kill "$CLIP_PID" 2>/dev/null || true; fi
   if [ -n "$CLIP_DIR" ]; then rm -rf "$CLIP_DIR" 2>/dev/null || true; fi
+  return 0
+}
+
+# Leftovers from runs that were killed before their trap could fire. A bridge directory is
+# named <hostname>-<pid> (just <pid> in the old ~/.cache location):
+#   * ours (same hostname): the pid tells. Going by the pid rather than by age means we
+#     never pull the bridge out from under a session that has simply been open for long;
+#   * someone else's: the config directory can be shared with a ccd in another pid
+#     namespace (a workstation container next to the host itself), where our 'kill -0'
+#     says nothing. There the poller's heartbeat decides: untouched for an hour = dead.
+clip_reap_stale() {
+  local root="$1" host="$2" dir name pid owner recent
+  for dir in "$root"/*; do
+    [ -d "$dir" ] || continue
+    name="${dir##*/}"
+    pid="${name##*-}"
+    case "$pid" in
+      ''|*[!0-9]*) continue ;;            # not a bridge directory — leave it alone
+    esac
+    owner="${name%"$pid"}"; owner="${owner%-}"
+    if [ -z "$owner" ] || [ "$owner" = "$host" ]; then
+      kill -0 "$pid" 2>/dev/null || rm -rf "$dir" 2>/dev/null || true
+    else
+      # A 'find' that fails proves nothing, so then the directory stays.
+      recent="$(find "$dir" -maxdepth 1 -mmin -60 2>/dev/null)" || continue
+      [ -n "$recent" ] || rm -rf "$dir" 2>/dev/null || true
+    fi
+  done
   return 0
 }
 
@@ -1042,26 +1113,31 @@ clip_bridge_start() {
   fi
   [ "$CLIP_BACKEND" = "none" ] && [ "$URL_BACKEND" = "none" ] && return 0
 
-  local root="${XDG_CACHE_HOME:-$HOME/.cache}/ccd/clipboard"
+  # Where the bridge lives matters: the Docker daemon resolves the bind mount on *its*
+  # filesystem. With the daemon in a VM (Colima, Docker Desktop, a dind VM) only the
+  # directories shared into that VM arrive; for anything else dockerd quietly creates an
+  # empty directory on the VM's own disk, and container and poller then each watch their
+  # own copy. So it goes under the config directory, which is known to get through (the
+  # mount check further down refuses to start otherwise), not under ~/.cache.
+  local root="${CCD_BRIDGE_DIR:-$CONFIG_DIR/.ccd-bridge}"
   mkdir -p "$root" 2>/dev/null || return 0
+  chmod 700 "$root" 2>/dev/null || true
 
-  # Leftovers from a run that was killed before its trap could fire. The directory is
-  # named after the ccd pid, so anything whose process is gone is dead weight — and going
-  # by the pid rather than by age means we never pull the bridge out from under a session
-  # that has simply been open for a long time.
-  local stale
-  for stale in "$root"/*; do
-    [ -d "$stale" ] || continue
-    case "${stale##*/}" in
-      ''|*[!0-9]*) continue ;;            # not a pid directory — leave it alone
-    esac
-    kill -0 "${stale##*/}" 2>/dev/null || rm -rf "$stale" 2>/dev/null || true
-  done
+  local host="${HOSTNAME:-$(hostname 2>/dev/null || echo host)}"
+  host="${host//[!A-Za-z0-9._]/_}"
+  clip_reap_stale "$root" "$host"
+  # The location used before; nothing is created there any more.
+  local legacy="${XDG_CACHE_HOME:-$HOME/.cache}/ccd/clipboard"
+  if [ -d "$legacy" ]; then
+    clip_reap_stale "$legacy" "$host"
+    rmdir "$legacy" 2>/dev/null || true
+  fi
 
-  CLIP_DIR="$root/$$"
+  CLIP_DIR="$root/$host-$$"
   rm -rf "$CLIP_DIR"
   mkdir -p "$CLIP_DIR" || { CLIP_DIR=""; return 0; }
   chmod 700 "$CLIP_DIR" 2>/dev/null || true
+  : > "$CLIP_DIR/.alive" 2>/dev/null || true
 
   clip_bridge_loop &
   CLIP_PID=$!
@@ -1069,6 +1145,9 @@ clip_bridge_start() {
 
   RUN_FLAGS+=(-v "$(to_daemon_path "$CLIP_DIR")":"$CLIP_MOUNT")
   RUN_FLAGS+=(-e CCD_CLIP_BRIDGE="$CLIP_MOUNT")
+  # For the entrypoint's round-trip check: it pings the poller at startup and, when no
+  # answer comes, names this path in its warning.
+  RUN_FLAGS+=(-e CCD_HOST_CLIP_DIR="$(to_daemon_path "$CLIP_DIR")")
   # Tells the entrypoint to point $BROWSER at the bridge shim.
   [ "$URL_BACKEND" != "none" ] && RUN_FLAGS+=(-e CCD_BROWSER_BRIDGE=1)
   return 0
